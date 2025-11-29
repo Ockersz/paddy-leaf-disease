@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Single-file Paddy Disease Chatbot API (FastAPI)
+Paddy Disease Chatbot API (FastAPI + ML Intent Classifier with history fallback)
 
 Expected files in the SAME folder:
 - symptoms_causes.csv
 - treatments_scenarios.csv
+- intent_classifier.joblib
 
 Run:
     uvicorn chatbot_api:app --reload
@@ -20,6 +21,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import joblib
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -59,17 +61,28 @@ class TreatmentOption:
 # -----------------------------------------------------------------------------
 
 class Intent(Enum):
-    SYMPTOMS = auto()
-    MANAGEMENT = auto()
-    PREVENTION = auto()
-    CAUSE = auto()
-    GENERAL = auto()
+    SYMPTOMS = auto()      # describing / asking what it looks like
+    MANAGEMENT = auto()    # treatment / control
+    PREVENTION = auto()    # prevent / next season
+    CAUSE = auto()         # what causes this
+    GENERAL = auto()       # catch all / chit-chat / misc
 
 
 class ChatRole(str, Enum):
     user = "user"
     assistant = "assistant"
     system = "system"
+
+
+# Raw labels from the ML classifier
+INTENT_LABELS = {
+    "SYMPTOM_DESCRIPTION",
+    "ASK_DIAGNOSIS",
+    "ASK_TREATMENT",
+    "ASK_PREVENTION",
+    "ASK_CAUSE",
+    "OTHER",
+}
 
 
 # -----------------------------------------------------------------------------
@@ -97,11 +110,11 @@ class ChatResponse(BaseModel):
     session_id: str
     reply: str
     disease_name: Optional[str] = None
-    intent: Optional[str] = None
+    intent: Optional[str] = None            # high-level intent name
+    raw_intent_label: Optional[str] = None  # ML label (SYMPTOM_DESCRIPTION, ASK_TREATMENT, etc.)
     awaiting_refinement: bool = False
     used_cnn_prediction: bool = False
     debug: Dict[str, object] = Field(default_factory=dict)
-    suggested_next_questions: List[str] = Field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
@@ -114,6 +127,7 @@ class SessionState:
     current_disease: Optional[str] = None
     awaiting_refinement: bool = False
     last_intent: Optional[Intent] = None
+    last_intent_label: Optional[str] = None
     used_cnn_prediction: bool = False
     last_guess_score: float = 0.0
 
@@ -160,57 +174,14 @@ def preprocess_text(text: str) -> List[str]:
     return tokens
 
 
-SYMPTOM_TRIGGERS = [
-    "symptom", "symptoms", "sign", "signs",
-    "what does it look", "how does it look",
-    "appearance", "looks like", "identify", "identify this",
-    "spot", "spots", "lesion", "lesions", "patches",
-]
-
-MANAGEMENT_TRIGGERS = [
-    "treat", "treatment", "manage", "management", "control",
-    "spray", "spraying", "medicine", "pesticide", "fungicide",
-    "insecticide", "what should i do", "how do i get rid",
-    "how to get rid", "how can i get rid",
-]
-
-PREVENTION_TRIGGERS = [
-    "prevent", "prevention", "avoid getting", "avoid this",
-    "next time", "future season", "how not to get",
-]
-
-CAUSE_TRIGGERS = [
-    "cause", "caused by", "what causes", "pathogen",
-    "virus", "bacteria", "fungus", "insect", "bug",
-]
-
-DIAGNOSIS_TRIGGERS = [
-    "what disease", "which disease",
-    "what is this disease", "name of this disease",
-    "what is this problem", "what problem is this",
-    "what is this", "what could this be",
-]
-
-
-def detect_intent(question: Optional[str]) -> Intent:
-    if not question:
-        return Intent.GENERAL
-    q = question.lower()
-    if any(t in q for t in MANAGEMENT_TRIGGERS):
-        return Intent.MANAGEMENT
-    if any(t in q for t in PREVENTION_TRIGGERS):
-        return Intent.PREVENTION
-    if any(t in q for t in CAUSE_TRIGGERS):
-        return Intent.CAUSE
-    if any(t in q for t in SYMPTOM_TRIGGERS):
-        return Intent.SYMPTOMS
-    return Intent.GENERAL
-
-
 def guess_disease_from_symptoms(
     kb: Dict[str, DiseaseInfo],
     symptom_text: str,
 ) -> Tuple[Optional[str], float, Dict[str, List[str]]]:
+    """
+    Use token overlap between user symptom text and stored
+    leaf symptom keywords + detailed description.
+    """
     user_tokens = set(preprocess_text(symptom_text))
     if not user_tokens:
         return None, 0.0, {}
@@ -228,6 +199,7 @@ def guess_disease_from_symptoms(
         common_kw = kw_tokens.intersection(user_tokens)
         common_desc = desc_tokens.intersection(user_tokens)
 
+        # Weighted: keyword matches count double
         score = 2 * len(common_kw) + 1 * len(common_desc)
         matches_per[name] = list(common_kw.union(common_desc))
 
@@ -245,6 +217,10 @@ def guess_disease_from_symptoms(
 def extract_context_from_text(
     text: str,
 ) -> Tuple[str, str, str]:
+    """
+    Roughly extract (crop_stage, weather_condition, water_condition)
+    from a free-text description.
+    """
     lower = text.lower()
 
     # crop stage
@@ -277,30 +253,70 @@ def extract_context_from_text(
     return stage, weather, water
 
 
-def build_context_text(history: List[HistoryItem], current_message: str) -> str:
-    user_texts = [h.content for h in history if h.role == ChatRole.user]
-    return " ".join(user_texts + [current_message]).strip()
-
-
-def get_previous_user_message(history: List[HistoryItem]) -> Optional[str]:
-    for h in reversed(history):
-        if h.role == ChatRole.user:
-            return h.content
-    return None
-
-
 # -----------------------------------------------------------------------------
-# Knowledge loading (CSV)
+# Intent classifier loading
 # -----------------------------------------------------------------------------
 
 def get_base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def load_intent_model():
+    path = get_base_dir() / "intent_classifier.joblib"
+    if not path.exists():
+        print("[WARN] intent_classifier.joblib not found – falling back to naive GENERAL intent.")
+        return None
+    print(f"[INFO] Loading intent classifier from {path}")
+    return joblib.load(path)
+
+
+INTENT_MODEL = load_intent_model()
+
+
+def map_label_to_intent(label: str) -> Intent:
+    """
+    Map the ML label to our high-level Intent enum.
+    """
+    if label == "SYMPTOM_DESCRIPTION":
+        return Intent.SYMPTOMS
+    if label == "ASK_DIAGNOSIS":
+        # Asking disease name is effectively a 'what disease / symptoms' question
+        return Intent.SYMPTOMS
+    if label == "ASK_TREATMENT":
+        return Intent.MANAGEMENT
+    if label == "ASK_PREVENTION":
+        return Intent.PREVENTION
+    if label == "ASK_CAUSE":
+        return Intent.CAUSE
+    # OTHER or unknown
+    return Intent.GENERAL
+
+
+def detect_intent_ml(message: str) -> Tuple[Intent, str]:
+    """
+    Use the ML model to predict intent.
+    Returns:
+        (high_level_intent, raw_label)
+    """
+    if INTENT_MODEL is None:
+        return Intent.GENERAL, "OTHER"
+
+    label = INTENT_MODEL.predict([message])[0]
+    if label not in INTENT_LABELS:
+        label = "OTHER"
+
+    intent = map_label_to_intent(label)
+    return intent, label
+
+
+# -----------------------------------------------------------------------------
+# Knowledge loading (CSV)
+# -----------------------------------------------------------------------------
+
 def load_symptoms_causes() -> Dict[str, DiseaseInfo]:
     path = get_base_dir() / "symptoms_causes.csv"
     if not path.exists():
-        raise FileNotFoundError(f"symptoms_causes.csv not found at {path}")
+        raise FileNotFoundError("symptoms_causes.csv not found next to chatbot_api.py")
 
     kb: Dict[str, DiseaseInfo] = {}
     with path.open(newline="", encoding="utf-8") as f:
@@ -326,7 +342,7 @@ def load_symptoms_causes() -> Dict[str, DiseaseInfo]:
 def load_treatments() -> Dict[str, List[TreatmentOption]]:
     path = get_base_dir() / "treatments_scenarios.csv"
     if not path.exists():
-        raise FileNotFoundError(f"treatments_scenarios.csv not found at {path}")
+        raise FileNotFoundError("treatments_scenarios.csv not found next to chatbot_api.py")
 
     disease_to_options: Dict[str, List[TreatmentOption]] = {}
     with path.open(newline="", encoding="utf-8") as f:
@@ -477,91 +493,35 @@ def format_refined_treatments(
     return "\n".join(parts)
 
 
-def build_suggested_questions(
-    last_intent: Optional[Intent],
-    awaiting_refinement: bool,
-    disease_name: Optional[str],
-) -> List[str]:
-    display_name = disease_name.replace("_", " ") if disease_name else "this problem"
-
-    if awaiting_refinement:
-        return [
-            "It’s rainy and humid, plants are at tillering with standing water.",
-            "It’s been hot and dry, soil is cracked and plants are at vegetative stage.",
-            "Weather is normal, field is at booting–heading with alternate wetting and drying.",
-        ]
-
-    if last_intent in (Intent.MANAGEMENT, Intent.PREVENTION):
-        return [
-            "Can you summarise the most important 2–3 actions?",
-            f"How can I prevent {display_name} in the next season?",
-            "Is there an organic or low-chemical option?",
-        ]
-
-    if last_intent == Intent.SYMPTOMS:
-        return [
-            f"How do I treat {display_name}?",
-            f"What causes {display_name}?",
-            "How can I tell this apart from nutrient deficiency?",
-        ]
-
-    if last_intent == Intent.CAUSE:
-        return [
-            f"How do I control {display_name} now?",
-            f"How can I reduce the risk of {display_name} coming back?",
-        ]
-
-    return [
-        "What treatments do you recommend for my situation?",
-        "How can I prevent this in future seasons?",
-        "What exactly causes this problem?",
-    ]
-
-
 def answer_question(
     kb: Dict[str, DiseaseInfo],
     treatments_map: Dict[str, List[TreatmentOption]],
     disease_name: str,
     message: str,
-    disease_source: str = "unknown",
-) -> Tuple[str, Intent, bool]:
+    intent: Intent,
+) -> Tuple[str, bool]:
+    """
+    Core brain once we know:
+    - which disease_name,
+    - which high-level intent.
+    Returns:
+        reply_text, needs_refinement_flag
+    """
     disease_name = disease_name.strip()
     if disease_name not in kb:
         return (
             "I don’t have specific information for '%s' yet. Please check if the disease name matches the knowledge base."
             % disease_name,
-            Intent.GENERAL,
             False,
         )
 
     info = kb[disease_name]
-    intent = detect_intent(message)
-    lower_msg = message.lower()
-    diagnosis_mode = any(t in lower_msg for t in DIAGNOSIS_TRIGGERS)
 
-    from_cnn = disease_source == "cnn"
-    from_symptoms = disease_source == "symptoms"
-    from_session = disease_source == "session"
-
-    if intent == Intent.GENERAL:
-        user_tokens = set(preprocess_text(message))
-        disease_tokens = set()
-        for kw in info.key_leaf_symptom_keywords:
-            disease_tokens.update(preprocess_text(kw))
-        disease_tokens.update(preprocess_text(info.leaf_symptoms_detailed))
-        if disease_tokens.intersection(user_tokens):
-            intent = Intent.SYMPTOMS
-
+    # Healthy crop special case
     if disease_name == "normal":
         if intent in (Intent.MANAGEMENT, Intent.PREVENTION):
-            lead = "The crop appears healthy based on the current diagnosis."
-            if from_cnn:
-                lead = "From the uploaded image(s), the plants are being classified as **healthy**."
-            elif from_symptoms:
-                lead = "From the symptoms you described, there are no clear signs of major leaf disease."
-
             txt = (
-                f"{lead}\n\n"
+                "The crop appears healthy based on the current diagnosis.\n\n"
                 "To keep it that way, focus on good agronomy:\n"
                 "- Use recommended varieties and certified seed.\n"
                 "- Maintain balanced fertilisation and good land levelling.\n"
@@ -569,158 +529,161 @@ def answer_question(
                 "- Monitor regularly so that any pest or disease is caught early.\n\n"
                 "No disease-specific pesticide is needed when the crop is healthy."
             )
-            return txt, intent, False
+            return txt, False
 
         txt = format_disease_explanation(info)
-        return txt, intent, False
+        return txt, False
 
-    display_name = info.name.replace("_", " ")
+    # SYMPTOMS: describe what it looks like (and implied diagnosis)
+    if intent == Intent.SYMPTOMS:
+        txt = format_disease_explanation(info)
+        return txt, False
 
-    if intent == Intent.SYMPTOMS or (intent == Intent.GENERAL and diagnosis_mode):
-        lead_parts: List[str] = []
-
-        if from_cnn:
-            lead_parts.append(
-                "Based on the uploaded image(s), this most likely matches **%s**."
-                % display_name
-            )
-        elif from_symptoms:
-            lead_parts.append(
-                "From the symptoms you described, this most likely matches **%s**."
-                % display_name
-            )
-        elif from_session:
-            lead_parts.append(
-                "Continuing from your earlier messages, we are still talking about **%s**."
-                % display_name
-            )
-        else:
-            lead_parts.append("This looks consistent with **%s**." % display_name)
-
-        explanation = format_disease_explanation(info)
-        tail = (
-            "\n\nYou can ask follow-up questions such as:\n"
-            "- How do I treat or control this disease?\n"
-            "- How can I prevent it next season?\n"
-            "- What exactly causes this problem?"
-        )
-
-        return " ".join(lead_parts) + "\n\n" + explanation + tail, intent, False
-
+    # CAUSE: focus on cause + conditions
     if intent == Intent.CAUSE:
-        lead = "Here is what typically causes **%s**:" % display_name
-        if from_cnn:
-            lead = (
-                "From the uploaded image(s), this appears to be **%s**. Here is what typically causes it:"
-                % display_name
-            )
-        elif from_symptoms:
-            lead = (
-                "From your symptom description, this appears to be **%s**. Here is what typically causes it:"
-                % display_name
-            )
-
         txt = (
-            f"{lead}\n\n"
-            f"{info.cause_summary}\n\n"
-            f"Conditions that favour this problem:\n{info.conditions_favouring}"
+            "Cause of %s:\n%s\n\nConditions that favour this problem:\n%s"
+            % (info.name.replace("_", " "), info.cause_summary, info.conditions_favouring)
         )
-        return txt, intent, False
+        return txt, False
 
-    if intent in (Intent.MANAGEMENT, Intent.PREVENTION):
+    # PREVENTION: same tools as management, framed for next season
+    if intent == Intent.PREVENTION:
         options = treatments_map.get(disease_name, [])
         overview = format_treatment_overview(disease_name, options)
-
-        lead_parts: List[str] = []
-        if from_cnn:
-            lead_parts.append(
-                "Based on the image analysis, the disease is likely **%s**."
-                % display_name
-            )
-        elif from_symptoms:
-            lead_parts.append(
-                "From the symptoms you described, the disease appears to be **%s**."
-                % display_name
-            )
-        elif from_session:
-            lead_parts.append(
-                "We are still dealing with **%s** from your previous description."
-                % display_name
-            )
-        else:
-            lead_parts.append("This appears to be **%s**." % display_name)
-
-        if intent == Intent.PREVENTION:
-            lead_parts.append(
-                "Here are management and prevention options to reduce current damage "
-                "and lower the risk in future seasons."
-            )
-        else:
-            lead_parts.append(
-                "Here are the main management options you can consider."
-            )
-
-        txt = " ".join(lead_parts) + "\n\n" + overview
-        return txt, intent, True
-
-    explanation = format_disease_explanation(info)
-    lead = "Here is a summary for **%s**." % display_name
-    if from_cnn:
-        lead = (
-            "Based on the uploaded image(s), this has been classified as **%s**."
-            % display_name
+        txt = (
+            "For prevention in future seasons, you generally use the same set of measures "
+            "as for management, but applied earlier and more systematically.\n\n%s"
+            % overview
         )
-    elif from_symptoms:
-        lead = (
-            "From the symptoms you described, this most closely matches **%s**."
-            % display_name
-        )
+        return txt, True  # ask for conditions to refine further
 
-    tail = (
+    # MANAGEMENT / TREATMENT
+    if intent == Intent.MANAGEMENT:
+        options = treatments_map.get(disease_name, [])
+        overview = format_treatment_overview(disease_name, options)
+        return overview, True
+
+    # GENERAL / fallback: give explanation + hints
+    txt = format_disease_explanation(info)
+    txt += (
         "\n\nYou can ask follow-up questions such as:\n"
         "- How do I treat this disease?\n"
         "- How can I prevent it next season?\n"
         "- What exactly causes this problem?"
     )
+    return txt, False
 
-    return f"{lead}\n\n{explanation}{tail}", Intent.GENERAL, False
 
-
-def refine_treatments_for_context(
+def refine_treatments_for_message(
     treatments_map: Dict[str, List[TreatmentOption]],
     disease_name: str,
-    context_text: str,
-) -> Tuple[str, str, str, str]:
-    stage, weather, water = extract_context_from_text(context_text)
+    message: str,
+) -> str:
+    stage, weather, water = extract_context_from_text(message)
     all_opts = treatments_map.get(disease_name, [])
     relevant = filter_treatments_for_context(all_opts, stage, weather, water)
+    return format_refined_treatments(disease_name, relevant, stage, weather, water)
 
-    header = (
-        "Thanks, that helps.\n\n"
-        "From what you said, I’m assuming:\n"
-        f"- Stage: **{stage}**\n"
-        f"- Weather: **{weather}**\n"
-        f"- Water: **{water}**\n\n"
-    )
 
-    core = format_refined_treatments(disease_name, relevant, stage, weather, water)
-    return header + core, stage, weather, water
+# -----------------------------------------------------------------------------
+# History-based disease inference (NEW)
+# -----------------------------------------------------------------------------
+
+def infer_disease_from_history(
+    kb: Dict[str, DiseaseInfo],
+    history: List[HistoryItem],
+    debug: Dict[str, object],
+) -> Optional[str]:
+    """
+    Look through previous user messages in history and try to recover a disease
+    based on the last SYMPTOM_DESCRIPTION / ASK_DIAGNOSIS-like messages.
+
+    This makes follow-ups like "How to treat it?" work even if session_id
+    wasn't reused by the frontend.
+    """
+    if not history:
+        return None
+
+    best_disease = None
+    best_score = 0.0
+    used_message = None
+
+    # Walk from latest to oldest
+    for item in reversed(history):
+        if item.role != ChatRole.user:
+            continue
+
+        intent, raw_label = detect_intent_ml(item.content)
+
+        if raw_label not in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
+            continue
+
+        guessed, score, matches = guess_disease_from_symptoms(kb, item.content)
+        if guessed and score > best_score:
+            best_disease = guessed
+            best_score = score
+            used_message = {
+                "text": item.content,
+                "raw_label": raw_label,
+                "score": score,
+                "overlap_tokens": matches.get(guessed, []),
+            }
+
+    if best_disease:
+        debug["history_disease_inferred"] = {
+            "disease": best_disease,
+            "score": best_score,
+            "from_message": used_message,
+        }
+    return best_disease
+
+def history_suggests_treatment_or_prevention(
+    history: List[HistoryItem]
+) -> bool:
+    """
+    Look backwards through user history.
+    If the last *relevant* user message was ASK_TREATMENT or ASK_PREVENTION,
+    we treat the current context-only message as a refinement.
+
+    We stop when we hit a clear symptom/diagnosis message, because that usually
+    means a new case.
+    """
+    for item in reversed(history):
+        if item.role != ChatRole.user:
+            continue
+
+        intent, raw_label = detect_intent_ml(item.content)
+
+        # If the last relevant question was about treatment/prevention,
+        # we want to refine for that.
+        if raw_label in ("ASK_TREATMENT", "ASK_PREVENTION"):
+            return True
+
+        # If we reach a symptom/diagnosis before any treatment/prevention,
+        # consider that a "new case" and stop.
+        if raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
+            return False
+
+    return False
+
 
 
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Paddy Disease Chatbot API (single file)")
+app = FastAPI(title="Paddy Disease Chatbot API (intent classifier + history)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this for production
+    allow_origins=["*"],  # tighten this in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Load knowledge at import time
 KB: Dict[str, DiseaseInfo] = load_symptoms_causes()
 TREATMENTS: Dict[str, List[TreatmentOption]] = load_treatments()
 SESSIONS = SessionStore()
@@ -731,6 +694,7 @@ async def health() -> Dict[str, object]:
     return {
         "status": "ok",
         "diseasesLoaded": list(KB.keys()),
+        "intentModelLoaded": INTENT_MODEL is not None,
     }
 
 
@@ -739,205 +703,139 @@ async def chat(req: ChatRequest) -> ChatResponse:
     state = SESSIONS.get_or_create(req.session_id)
     debug: Dict[str, object] = {}
     used_cnn = False
-    disease_source = "unknown"
 
-    # Build context and intents
-    context_text = build_context_text(req.history, req.message)
-    message_intent = detect_intent(req.message)
-    previous_user_msg = get_previous_user_message(req.history)
-    previous_user_intent = detect_intent(previous_user_msg)
+    # If we are in "refinement" mode, this message is treated as weather/stage context
+    if state.awaiting_refinement and state.current_disease:
+        refined = refine_treatments_for_message(TREATMENTS, state.current_disease, req.message)
+        state.awaiting_refinement = False
+        SESSIONS.update(state)
+        return ChatResponse(
+            session_id=state.session_id,
+            reply=refined,
+            disease_name=state.current_disease,
+            intent=state.last_intent.name if state.last_intent else None,
+            raw_intent_label=state.last_intent_label,
+            awaiting_refinement=False,
+            used_cnn_prediction=state.used_cnn_prediction,
+            debug=debug,
+        )
 
-    ctx_stage, ctx_weather, ctx_water = extract_context_from_text(context_text)
-    has_rich_context = (
-        ctx_stage != "general" or ctx_weather != "normal" or ctx_water != "any"
-    )
-    debug["extracted_context"] = {
-        "stage": ctx_stage,
-        "weather": ctx_weather,
-        "water": ctx_water,
-        "has_rich_context": has_rich_context,
-    }
-    debug["message_intent"] = message_intent.name
-    debug["previous_user_intent"] = previous_user_intent.name if previous_user_intent else None
+    # -----------------------
+    # 1) Predict intent from text (ML)
+    # -----------------------
+    intent, raw_label = detect_intent_ml(req.message)
+    debug["raw_intent_label"] = raw_label
+    debug["intent"] = intent.name
 
-    # Disease selection
+    # -----------------------
+    # 2) Decide disease (NEW ORDERING)
+    # -----------------------
     disease: Optional[str] = None
 
+    # 2.1 CNN prediction first (if supplied & confident)
     if req.cnn_prediction and req.cnn_prediction.confidence >= 0.6:
         pred_name = req.cnn_prediction.disease_name.strip()
         if pred_name in KB:
             disease = pred_name
             used_cnn = True
-            disease_source = "cnn"
             debug["cnn_prediction_used"] = True
             debug["cnn_confidence"] = req.cnn_prediction.confidence
         else:
             debug["cnn_prediction_ignored"] = f"Unknown disease '{pred_name}'"
 
+    # 2.2 If we already have a disease in this session, reuse it
     if disease is None and state.current_disease:
         disease = state.current_disease
-        disease_source = "session"
         debug["session_disease_reused"] = disease
 
-    if disease is None:
-        guessed, score, matches = guess_disease_from_symptoms(
-            KB,
-            context_text or req.message,
-        )
+    # 2.3 Try to infer disease from HISTORY (previous user messages)
+    if disease is None and req.history:
+        inferred = infer_disease_from_history(KB, req.history, debug)
+        if inferred:
+            disease = inferred
+            debug["history_disease_used"] = inferred
+
+    # 2.4 If STILL no disease, and the CURRENT message looks like
+    #     symptoms / diagnosis question, guess from THIS message
+    if disease is None and raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
+        guessed, score, matches = guess_disease_from_symptoms(KB, req.message)
         if guessed:
             disease = guessed
-            disease_source = "symptoms"
             state.last_guess_score = score
-            debug["symptom_guess"] = {
+            debug["symptom_guess_current_message"] = {
                 "disease": guessed,
                 "score": score,
                 "overlap_tokens": matches.get(guessed, []),
             }
 
+    # 2.5 Absolute last resort – try guessing from this message anyway
+    if disease is None:
+        guessed, score, matches = guess_disease_from_symptoms(KB, req.message)
+        if guessed:
+            disease = guessed
+            state.last_guess_score = score
+            debug["symptom_guess_fallback"] = {
+                "disease": guessed,
+                "score": score,
+                "overlap_tokens": matches.get(guessed, []),
+            }
+
+    # -----------------------
+    # 3) If still no disease – generic fail-safe reply
+    # -----------------------
     if disease is None:
         reply = (
-            "I could not confidently match those symptoms to a specific disease in my "
-            "knowledge base (normal, blast, brown_spot, hispa, dead_heart, tungro).\n\n"
+            "I could not confidently match those symptoms or questions to a specific disease "
+            "in my knowledge base (normal, blast, brown_spot, hispa, dead_heart, tungro).\n\n"
             "It might be a nutrient problem, a different pest/disease, or symptoms not "
             "fully covered here. You can try describing:\n"
             "- colour and pattern of spots or streaks on leaves,\n"
             "- whether plants are stunted or tillering poorly,\n"
             "- and any insects or unusual weather recently."
         )
-        debug["disease_source"] = "none"
-        suggested = [
-            "Leaves have small brown spots with yellow halo.",
-            "Leaves show white lesions with brown border, especially near the neck.",
-            "Central tillers are drying and can be pulled out easily.",
-        ]
         return ChatResponse(
             session_id=state.session_id,
             reply=reply,
             disease_name=None,
-            intent=None,
+            intent=intent.name,
+            raw_intent_label=raw_label,
             awaiting_refinement=False,
             used_cnn_prediction=False,
             debug=debug,
-            suggested_next_questions=suggested,
         )
 
-    debug["disease_source"] = disease_source
+    # Store disease in session
     state.current_disease = disease
 
-    # -------------------------------------------------------------------------
-    # Decide if this turn should be treated as refinement
-    # -------------------------------------------------------------------------
-
-    # 1) Session said we were waiting for refinement (user has already asked “how to treat / prevent”)
-    should_refine = state.awaiting_refinement
-
-    # 2) OR: user previously asked a management/prevention question, and now sends only weather/stage/water
-    if (
-        not should_refine
-        and has_rich_context
-        and previous_user_intent in (Intent.MANAGEMENT, Intent.PREVENTION)
-        and message_intent == Intent.GENERAL
-    ):
-        should_refine = True
-        debug["refinement_trigger"] = "history_based"
-
-    # -------------------------------------------------------------------------
-    # Refinement path
-    # -------------------------------------------------------------------------
-    if should_refine:
-        refined, stg, wth, wat = refine_treatments_for_context(
-            TREATMENTS,
-            disease,
-            context_text,
-        )
-        state.awaiting_refinement = False
-        SESSIONS.update(state)
-
-        debug["refined_for"] = {
-            "stage": stg,
-            "weather": wth,
-            "water": wat,
-        }
-
-        suggested = build_suggested_questions(
-            last_intent=state.last_intent,
-            awaiting_refinement=False,
-            disease_name=disease,
+    # -----------------------
+    # 4) Build answer text
+    # -----------------------
+    header = ""
+    if raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
+        header = (
+            f"From the symptoms or question you provided, this most likely matches "
+            f"**{disease.replace('_', ' ')}**.\n\n"
         )
 
-        return ChatResponse(
-            session_id=state.session_id,
-            reply=refined,
-            disease_name=disease,
-            intent=state.last_intent.name if state.last_intent else None,
-            awaiting_refinement=False,
-            used_cnn_prediction=used_cnn,
-            debug=debug,
-            suggested_next_questions=suggested,
-        )
-
-    # -------------------------------------------------------------------------
-    # One-shot direct targeted management/prevention (with context in same msg)
-    # -------------------------------------------------------------------------
-    if message_intent in (Intent.MANAGEMENT, Intent.PREVENTION) and has_rich_context:
-        refined, stg, wth, wat = refine_treatments_for_context(
-            TREATMENTS,
-            disease,
-            context_text,
-        )
-        state.last_intent = message_intent
-        state.awaiting_refinement = False
-        state.used_cnn_prediction = used_cnn
-        SESSIONS.update(state)
-
-        debug["direct_refinement"] = {
-            "stage": stg,
-            "weather": wth,
-            "water": wat,
-        }
-
-        suggested = build_suggested_questions(
-            last_intent=message_intent,
-            awaiting_refinement=False,
-            disease_name=disease,
-        )
-
-        return ChatResponse(
-            session_id=state.session_id,
-            reply=refined,
-            disease_name=disease,
-            intent=message_intent.name,
-            awaiting_refinement=False,
-            used_cnn_prediction=used_cnn,
-            debug=debug,
-            suggested_next_questions=suggested,
-        )
-
-    # -------------------------------------------------------------------------
-    # Normal Q&A flow
-    # -------------------------------------------------------------------------
-    reply, intent, needs_refinement = answer_question(
-        KB, TREATMENTS, disease, req.message, disease_source
+    reply_body, needs_refinement = answer_question(
+        KB, TREATMENTS, disease, req.message, intent
     )
 
+    reply = header + reply_body
+
     state.last_intent = intent
+    state.last_intent_label = raw_label
     state.awaiting_refinement = needs_refinement
     state.used_cnn_prediction = used_cnn
     SESSIONS.update(state)
-
-    suggested = build_suggested_questions(
-        last_intent=intent,
-        awaiting_refinement=needs_refinement,
-        disease_name=disease,
-    )
 
     return ChatResponse(
         session_id=state.session_id,
         reply=reply,
         disease_name=disease,
-        intent=intent.name if intent else None,
+        intent=intent.name,
+        raw_intent_label=raw_label,
         awaiting_refinement=needs_refinement,
         used_cnn_prediction=used_cnn,
         debug=debug,
-        suggested_next_questions=suggested,
     )

@@ -10,7 +10,7 @@ import {
   Button,
   useTheme,
 } from "@mui/material";
-import { Brightness4, Brightness7, Send } from "@mui/icons-material";
+import { Brightness4, Brightness7, Send, RestartAlt } from "@mui/icons-material";
 import type { PaletteMode } from "@mui/material";
 
 type ChatRole = "user" | "assistant";
@@ -58,7 +58,7 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
   // ---- API call ----
   const sendToBackend = async (text: string, history: ChatMessage[]) => {
     const payload = {
-      sessionId: sessionIdRef.current,
+      session_id: sessionIdRef.current, // ✅ send correct field
       message: text,
       history: history.map((m) => ({ role: m.role, content: m.content })),
     };
@@ -74,7 +74,13 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
     }
 
     const data = await res.json();
-    return (data && data.reply) || "I couldn’t generate a proper reply.";
+
+    // ✅ sync session id from backend (in case backend created/changed it)
+    if (data.session_id && typeof data.session_id === "string") {
+      sessionIdRef.current = data.session_id;
+    }
+
+    return data; // return full response, not just reply text
   };
 
   const handleSend = async () => {
@@ -96,8 +102,11 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
       const historySnapshot = [...messages, userMessage];
 
       let replyText: string;
+
       try {
-        replyText = await sendToBackend(text, historySnapshot);
+        const data = await sendToBackend(text, historySnapshot);
+        replyText = data.reply || "I couldn’t generate a proper reply.";
+        // (optionally) inspect data.awaiting_refinement, data.debug, etc. here
       } catch (err) {
         console.warn("Backend error, falling back:", err);
         replyText =
@@ -123,10 +132,26 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
     }
   };
 
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  // 🔄 NEW CHAT HANDLER
+  const handleNewChat = () => {
+    sessionIdRef.current = createSessionId(); // new session id
+    setMessages([
+      { id: "m-0", role: "assistant", content: initialAssistantMessage },
+    ]);
+    setInput("");
+    setError(null);
+    setIsSending(false);
+    // optional: scroll to top
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = 0;
     }
   };
 
@@ -163,8 +188,8 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
             bgcolor: isUser
               ? theme.palette.primary.main
               : theme.palette.mode === "light"
-              ? theme.palette.background.paper
-              : "#020617",
+                ? theme.palette.background.paper
+                : "#020617",
             color: isUser
               ? theme.palette.primary.contrastText
               : theme.palette.text.primary,
@@ -220,13 +245,13 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
         {/* Header */}
         <Box
           sx={{
-            px: 2.5,
+            px: 1.5,
             py: 1.5,
             borderBottom: `1px solid ${theme.palette.divider}`,
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            gap: 2,
+            gap: 1,
           }}
         >
           <Stack direction="row" spacing={1.5} alignItems="center">
@@ -253,28 +278,41 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
             <Typography
               variant="caption"
               color="text.secondary"
-              sx={{ maxWidth: 180 }}
-              noWrap
+              sx={{ maxWidth: 200 }}
             >
               Session: {sessionIdRef.current}
             </Typography>
-            <IconButton
-              size="small"
-              onClick={toggleMode}
-              sx={{
-                borderRadius: 999,
-                bgcolor:
-                  mode === "light"
-                    ? "rgba(0,0,0,0.04)"
-                    : "rgba(255,255,255,0.08)",
-              }}
-            >
-              {mode === "light" ? (
-                <Brightness4 fontSize="small" />
-              ) : (
-                <Brightness7 fontSize="small" />
-              )}
-            </IconButton>
+
+            <Stack direction="row" spacing={1}>
+              {/* New chat button */}
+              <Button
+                variant="outlined"
+                size="small"
+                startIcon={<RestartAlt fontSize="small" />}
+                onClick={handleNewChat}
+              >
+                New chat
+              </Button>
+
+              {/* Theme toggle */}
+              <IconButton
+                size="small"
+                onClick={toggleMode}
+                sx={{
+                  borderRadius: 999,
+                  bgcolor:
+                    mode === "light"
+                      ? "rgba(0,0,0,0.04)"
+                      : "rgba(255,255,255,0.08)",
+                }}
+              >
+                {mode === "light" ? (
+                  <Brightness4 fontSize="small" />
+                ) : (
+                  <Brightness7 fontSize="small" />
+                )}
+              </IconButton>
+            </Stack>
           </Stack>
         </Box>
 
