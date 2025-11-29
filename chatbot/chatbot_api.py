@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 import joblib
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 
@@ -264,7 +266,7 @@ def get_base_dir() -> Path:
 def load_intent_model():
     path = get_base_dir() / "intent_classifier.joblib"
     if not path.exists():
-        print("[WARN] intent_classifier.joblib not found – falling back to naive GENERAL intent.")
+        print("[WARN] intent_classifier.joblib not found - falling back to naive GENERAL intent.")
         return None
     print(f"[INFO] Loading intent classifier from {path}")
     return joblib.load(path)
@@ -510,7 +512,7 @@ def answer_question(
     disease_name = disease_name.strip()
     if disease_name not in kb:
         return (
-            "I don’t have specific information for '%s' yet. Please check if the disease name matches the knowledge base."
+            "I don't have specific information for '%s' yet. Please check if the disease name matches the knowledge base."
             % disease_name,
             False,
         )
@@ -677,7 +679,7 @@ app = FastAPI(title="Paddy Disease Chatbot API (intent classifier + history)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -838,4 +840,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
         awaiting_refinement=needs_refinement,
         used_cnn_prediction=used_cnn,
         debug=debug,
+    )
+
+frontend_dir = Path(__file__).resolve().parent / "frontend"
+
+if frontend_dir.exists():
+    # Serve the React build at root "/"
+    app.mount(
+        "/",
+        StaticFiles(directory=frontend_dir, html=True),
+        name="frontend",
     )
