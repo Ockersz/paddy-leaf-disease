@@ -58,7 +58,7 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
   // ---- API call ----
   const sendToBackend = async (text: string, history: ChatMessage[]) => {
     const payload = {
-      session_id: sessionIdRef.current, // ✅ send correct field
+      session_id: sessionIdRef.current,
       message: text,
       history: history.map((m) => ({ role: m.role, content: m.content })),
     };
@@ -75,7 +75,6 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
 
     const data = await res.json();
 
-    // ✅ sync session id from backend (in case backend created/changed it)
     if (data.session_id && typeof data.session_id === "string") {
       sessionIdRef.current = data.session_id;
     }
