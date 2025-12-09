@@ -26,7 +26,7 @@ interface PaddyChatProps {
   toggleMode: () => void;
 }
 
-const API_URL = "http://127.0.0.1:8000/api/chat";
+const API_URL = "http://127.0.0.1:5000/api/chat";
 
 const createSessionId = () =>
   `sess_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;

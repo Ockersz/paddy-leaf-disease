@@ -1,7 +1,7 @@
 # ---------------------------------------------------------
 # Stage 1: Build React frontend
 # ---------------------------------------------------------
-FROM node:22-alpine AS frontend-build
+FROM node:24 AS frontend-build
 
 WORKDIR /app/frontend
 
@@ -19,7 +19,7 @@ RUN npm run build
 # ---------------------------------------------------------
 # Stage 2: Python backend + built frontend
 # ---------------------------------------------------------
-FROM python:3.9-slim AS backend
+FROM python:3.10 AS backend
 
 WORKDIR /app
 
@@ -42,7 +42,7 @@ COPY chatbot/ ./
 COPY --from=frontend-build /app/frontend/dist ./frontend
 
 # Expose API port
-EXPOSE 8000
+EXPOSE 5000
 
 # Start FastAPI (serves both API and static frontend)
-CMD ["uvicorn", "chatbot_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "chatbot_api:app", "--host", "0.0.0.0", "--port", "5000"]
