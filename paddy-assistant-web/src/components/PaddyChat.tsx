@@ -10,8 +10,15 @@ import {
   Button,
   useTheme,
 } from "@mui/material";
-import { Brightness4, Brightness7, Send, RestartAlt } from "@mui/icons-material";
+import Chip from "@mui/material/Chip";
+import {
+  Brightness4,
+  Brightness7,
+  Send,
+  RestartAlt,
+} from "@mui/icons-material";
 import type { PaletteMode } from "@mui/material";
+import AddIcon from "@mui/icons-material/Add";
 
 type ChatRole = "user" | "assistant";
 
@@ -32,7 +39,7 @@ const createSessionId = () =>
   `sess_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;
 
 const initialAssistantMessage =
-  "Hi, I’m your paddy disease assistant. You can describe leaf symptoms or ask about a disease like blast, brown spot, hispa, dead heart or tungro. I’ll explain symptoms, causes and management, and I can refine treatments if you tell me the weather and crop stage.";
+  "Hi, I'm your paddy disease assistant. You can describe leaf symptoms or ask about a disease like blast, brown spot, hispa, dead heart or tungro. I'll explain symptoms, causes and management, and I can refine treatments if you tell me the weather and crop stage.";
 
 const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -42,11 +49,13 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [images, setImages] = useState<File[]>([]);
+
   const sessionIdRef = useRef<string>(createSessionId());
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const theme = useTheme();
 
-  const canSend = input.trim().length > 0 && !isSending;
+  const canSend = !isSending && (input.trim().length > 0 || images.length > 0);
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -55,18 +64,51 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
     }
   }, [messages.length]);
 
-  // ---- API call ----
-  const sendToBackend = async (text: string, history: ChatMessage[]) => {
-    const payload = {
-      session_id: sessionIdRef.current,
-      message: text,
-      history: history.map((m) => ({ role: m.role, content: m.content })),
-    };
+  // ---- Handle image selection ----
+  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    const fileArray = Array.from(files);
+    // Merge with existing, cap at 5
+    setImages((prev) => {
+      const merged = [...prev, ...fileArray];
+      if (merged.length > 5) {
+        setError("You can upload up to 5 images at a time.");
+      }
+      return merged.slice(0, 5);
+    });
+
+    // Reset the input so same file can be selected again later if needed
+    e.target.value = "";
+  };
+
+  const handleRemoveImage = (index: number) => {
+    setImages((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  // ---- API call (multipart) ----
+  const sendToBackend = async (
+    text: string,
+    history: ChatMessage[],
+    imageFiles: File[]
+  ) => {
+    const formData = new FormData();
+
+    formData.append("session_id", sessionIdRef.current);
+    formData.append("message", text);
+    formData.append(
+      "history",
+      JSON.stringify(history.map((m) => ({ role: m.role, content: m.content })))
+    );
+
+    imageFiles.forEach((file) => {
+      formData.append("images", file);
+    });
 
     const res = await fetch(API_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: formData,
     });
 
     if (!res.ok) {
@@ -79,7 +121,7 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
       sessionIdRef.current = data.session_id;
     }
 
-    return data; // return full response, not just reply text
+    return data;
   };
 
   const handleSend = async () => {
@@ -88,10 +130,12 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
     setInput("");
     setError(null);
 
+    const userTextSummary = text || (images.length > 0 ? "[Images only]" : "");
+
     const userMessage: ChatMessage = {
       id: `m-${Date.now()}-user`,
       role: "user",
-      content: text,
+      content: userTextSummary,
     };
 
     setMessages((prev) => [...prev, userMessage]);
@@ -103,15 +147,15 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
       let replyText: string;
 
       try {
-        const data = await sendToBackend(text, historySnapshot);
-        replyText = data.reply || "I couldn’t generate a proper reply.";
-        // (optionally) inspect data.awaiting_refinement, data.debug, etc. here
+        const data = await sendToBackend(text, historySnapshot, images);
+        replyText = data.reply || "I couldn't generate a proper reply.";
+        // you can also look at data.disease, data.confidence, etc. here
       } catch (err) {
         console.warn("Backend error, falling back:", err);
         replyText =
-          "📡 I couldn’t reach the backend right now. This is where I would give you a detailed answer " +
-          "based on your symptoms and previous messages.\n\n" +
-          `You said: "${text}"`;
+          "📡 I couldn't reach the backend right now. This is where I would give you a detailed answer " +
+          "based on the images and symptoms you sent.\n\n" +
+          (text ? `You said: "${text}"` : "");
       }
 
       const botMessage: ChatMessage = {
@@ -121,6 +165,8 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
       };
 
       setMessages((prev) => [...prev, botMessage]);
+      // after successful send, clear images for next turn
+      setImages([]);
     } catch (e: any) {
       console.error(e);
       setError(
@@ -130,7 +176,6 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
       setIsSending(false);
     }
   };
-
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -146,9 +191,9 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
       { id: "m-0", role: "assistant", content: initialAssistantMessage },
     ]);
     setInput("");
+    setImages([]);
     setError(null);
     setIsSending(false);
-    // optional: scroll to top
     if (scrollRef.current) {
       scrollRef.current.scrollTop = 0;
     }
@@ -187,8 +232,8 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
             bgcolor: isUser
               ? theme.palette.primary.main
               : theme.palette.mode === "light"
-                ? theme.palette.background.paper
-                : "#020617",
+              ? theme.palette.background.paper
+              : "#020617",
             color: isUser
               ? theme.palette.primary.contrastText
               : theme.palette.text.primary,
@@ -267,8 +312,8 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
                 Paddy Disease Assistant
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                Describe leaf symptoms or ask follow-up questions. I’ll use this
-                session’s history to keep context.
+                Upload up to 5 leaf images and describe symptoms. I'll keep this
+                session's history for follow-up questions.
               </Typography>
             </Box>
           </Stack>
@@ -283,7 +328,6 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
             </Typography>
 
             <Stack direction="row" spacing={1}>
-              {/* New chat button */}
               <Button
                 variant="outlined"
                 size="small"
@@ -293,7 +337,6 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
                 New chat
               </Button>
 
-              {/* Theme toggle */}
               <IconButton
                 size="small"
                 onClick={toggleMode}
@@ -330,11 +373,7 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
         >
           {messages.map(renderMessage)}
           {isSending && (
-            <Typography
-              variant="caption"
-              color="text.secondary"
-              sx={{ mt: 1 }}
-            >
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 1 }}>
               Thinking about your field…
             </Typography>
           )}
@@ -349,7 +388,7 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
           </Box>
         )}
 
-        {/* Input */}
+        {/* Input + images */}
         <Box
           sx={{
             borderTop: `1px solid ${theme.palette.divider}`,
@@ -357,6 +396,21 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
             py: 1.5,
           }}
         >
+          {/* Selected images chips */}
+          {images.length > 0 && (
+            <Stack direction="row" spacing={1} sx={{ mb: 1, flexWrap: "wrap" }}>
+              {images.map((file, idx) => (
+                <Chip
+                  key={`${file.name}-${idx}`}
+                  label={file.name}
+                  size="small"
+                  onDelete={() => handleRemoveImage(idx)}
+                  sx={{ maxWidth: 200 }}
+                />
+              ))}
+            </Stack>
+          )}
+
           <Stack
             direction="row"
             spacing={1.5}
@@ -367,6 +421,22 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
               handleSend();
             }}
           >
+            <Button
+              variant="outlined"
+              component="label"
+              size="small"
+              sx={{ alignSelf: "stretch", whiteSpace: "nowrap" }}
+            >
+              {images.length > 0 ? `${images.length}/5` : <AddIcon />}
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                hidden
+                onChange={handleImageChange}
+              />
+            </Button>
+
             <TextField
               fullWidth
               multiline
