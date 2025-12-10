@@ -3,3 +3,5 @@ uvicorn[standard]
 python-multipart
 joblib
 scikit-learn
+tensorflow==2.20.0
+keras==3.10.0

@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Paddy Disease Chatbot API (FastAPI + ML Intent Classifier with history fallback)
+Paddy Disease Chatbot API (FastAPI + ML Intent Classifier + Image CNN)
 
-Expected files in the SAME folder:
+Expected files in the SAME folder (chatbot directory):
 - symptoms_causes.csv
 - treatments_scenarios.csv
 - intent_classifier.joblib
+- best_model.keras        <-- image classifier
 
-Run:
-    uvicorn chatbot_api:app --reload
+Run (example):
+    uvicorn chatbot_api:app --reload --port 5000
 """
 
 from __future__ import annotations
 
 import csv
+import io
+import json
 import re
 import secrets
 from dataclasses import dataclass
@@ -22,11 +25,21 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import joblib
-from fastapi import FastAPI
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 from pydantic import BaseModel, Field
+from PIL import Image
+from tensorflow.keras.models import load_model as load_keras_model
+
+
+# -----------------------------------------------------------------------------
+# Paths / helpers
+# -----------------------------------------------------------------------------
+
+def get_base_dir() -> Path:
+    return Path(__file__).resolve().parent
 
 
 # -----------------------------------------------------------------------------
@@ -102,6 +115,7 @@ class CNNPrediction(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    """Kept for reference – actual endpoint uses multipart form instead."""
     session_id: Optional[str] = None
     message: str
     history: List[HistoryItem] = Field(default_factory=list)
@@ -259,10 +273,6 @@ def extract_context_from_text(
 # Intent classifier loading
 # -----------------------------------------------------------------------------
 
-def get_base_dir() -> Path:
-    return Path(__file__).resolve().parent
-
-
 def load_intent_model():
     path = get_base_dir() / "intent_classifier.joblib"
     if not path.exists():
@@ -300,6 +310,10 @@ def detect_intent_ml(message: str) -> Tuple[Intent, str]:
     Returns:
         (high_level_intent, raw_label)
     """
+    if not message.strip():
+        # No text: treat as GENERAL / OTHER
+        return Intent.GENERAL, "OTHER"
+
     if INTENT_MODEL is None:
         return Intent.GENERAL, "OTHER"
 
@@ -365,6 +379,128 @@ def load_treatments() -> Dict[str, List[TreatmentOption]]:
             )
             disease_to_options.setdefault(name, []).append(opt)
     return disease_to_options
+
+
+# -----------------------------------------------------------------------------
+# Image model (best_model.keras)
+# -----------------------------------------------------------------------------
+
+IMG_SIZE = 224
+CLASS_NAMES = ["normal", "blast", "brown_spot", "hispa", "dead_heart", "tungro"]
+
+MODEL_PATH = get_base_dir() / "best_model.keras"
+
+try:
+    if MODEL_PATH.exists():
+        print(f"[INFO] Loading image model from {MODEL_PATH}")
+        IMAGE_MODEL = load_keras_model(MODEL_PATH)
+    else:
+        print(f"[WARN] best_model.keras not found at {MODEL_PATH}. Image predictions disabled.")
+        IMAGE_MODEL = None
+except Exception as e:
+    print(f"[WARN] Failed to load best_model.keras: {e}")
+    IMAGE_MODEL = None
+
+
+def preprocess_image_bytes(data: bytes) -> np.ndarray:
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img = img.resize((IMG_SIZE, IMG_SIZE))
+    arr = np.array(img, dtype="float32") / 255.0
+    return arr  # shape (H, W, 3)
+
+
+def run_cnn_on_images(
+    upload_files: List[UploadFile],
+    debug: Dict[str, object],
+    confidence_threshold: float = 0.6,
+) -> Tuple[Optional[str], float, bool]:
+    """
+    Run the CNN on up to 5 images, return:
+      (cnn_disease, cnn_confidence, conflict_flag)
+
+    - cnn_disease: best class if confident and consistent, else None
+    - cnn_confidence: average top confidence for that class
+    - conflict_flag: True if high-confidence images disagree
+    """
+    if IMAGE_MODEL is None or not upload_files:
+        return None, 0.0, False
+
+    # Cap at 5 images as per frontend
+    upload_files = upload_files[:5]
+
+    images_arr: List[np.ndarray] = []
+    filenames: List[str] = []
+
+    for uf in upload_files:
+        data = uf.file.read()  # synchronous is fine inside FastAPI path
+        if not data:
+            continue
+        try:
+            arr = preprocess_image_bytes(data)
+            images_arr.append(arr)
+            filenames.append(uf.filename or "image")
+        except Exception as e:
+            # Skip problematic images but log in debug
+            debug.setdefault("image_errors", []).append(
+                {"filename": uf.filename, "error": str(e)}
+            )
+
+    if not images_arr:
+        return None, 0.0, False
+
+    batch = np.stack(images_arr, axis=0)  # shape (N, H, W, 3)
+    probs_batch = IMAGE_MODEL.predict(batch)
+    probs_batch = probs_batch.astype(float)
+
+    top_classes: List[str] = []
+    top_confidences: List[float] = []
+
+    per_image_debug = []
+
+    for i, probs in enumerate(probs_batch):
+        top_idx = int(np.argmax(probs))
+        top_disease = CLASS_NAMES[top_idx]
+        top_conf = float(probs[top_idx])
+
+        top_classes.append(top_disease)
+        top_confidences.append(top_conf)
+
+        per_image_debug.append(
+            {
+                "filename": filenames[i],
+                "top_class": top_disease,
+                "top_confidence": top_conf,
+                "probs": {name: float(p) for name, p in zip(CLASS_NAMES, probs)},
+            }
+        )
+
+    debug["image_predictions"] = per_image_debug
+
+    # Consider only reasonably confident predictions
+    high_conf_classes = [
+        cls for cls, conf in zip(top_classes, top_confidences)
+        if conf >= confidence_threshold
+    ]
+
+    if not high_conf_classes:
+        # All images are low confidence
+        return None, 0.0, False
+
+    unique_classes = set(high_conf_classes)
+    if len(unique_classes) > 1:
+        # Conflicting diseases across images
+        return None, 0.0, True
+
+    # All confident predictions agree on the same disease
+    consensus_class = next(iter(unique_classes))
+    avg_conf = float(
+        sum(conf for cls, conf in zip(top_classes, top_confidences)
+            if cls == consensus_class) / max(
+            sum(1 for cls in high_conf_classes if cls == consensus_class), 1
+        )
+    )
+
+    return consensus_class, avg_conf, False
 
 
 # -----------------------------------------------------------------------------
@@ -589,7 +725,7 @@ def refine_treatments_for_message(
 
 
 # -----------------------------------------------------------------------------
-# History-based disease inference (NEW)
+# History-based disease inference
 # -----------------------------------------------------------------------------
 
 def infer_disease_from_history(
@@ -640,8 +776,9 @@ def infer_disease_from_history(
         }
     return best_disease
 
+
 def history_suggests_treatment_or_prevention(
-    history: List[HistoryItem]
+    history: List[HistoryItem],
 ) -> bool:
     """
     Look backwards through user history.
@@ -670,12 +807,11 @@ def history_suggests_treatment_or_prevention(
     return False
 
 
-
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Paddy Disease Chatbot API (intent classifier + history)")
+app = FastAPI(title="Paddy Disease Chatbot API (intent classifier + history + images)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -697,18 +833,50 @@ async def health() -> Dict[str, object]:
         "status": "ok",
         "diseasesLoaded": list(KB.keys()),
         "intentModelLoaded": INTENT_MODEL is not None,
+        "imageModelLoaded": IMAGE_MODEL is not None,
     }
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
-    state = SESSIONS.get_or_create(req.session_id)
+async def chat(
+    session_id: Optional[str] = Form(None),
+    message: str = Form(""),
+    history: str = Form("[]"),
+    images: List[UploadFile] = File(default_factory=list),
+) -> ChatResponse:
+    """
+    Main chat endpoint.
+
+    Expects multipart/form-data from the React frontend:
+      - session_id: string (optional)
+      - message: string (may be empty if images only)
+      - history: JSON string of [{role, content}, ...]
+      - images: 0-5 image files (field name "images")
+    """
+    # Parse history JSON
+    history_items: List[HistoryItem] = []
     debug: Dict[str, object] = {}
+
+    try:
+        if history:
+            raw_list = json.loads(history)
+            if isinstance(raw_list, list):
+                for item in raw_list:
+                    try:
+                        history_items.append(HistoryItem(**item))
+                    except Exception as e:
+                        debug.setdefault("history_parse_errors", []).append(
+                            {"item": item, "error": str(e)}
+                        )
+    except Exception as e:
+        debug["history_json_error"] = str(e)
+
+    state = SESSIONS.get_or_create(session_id)
     used_cnn = False
 
     # If we are in "refinement" mode, this message is treated as weather/stage context
-    if state.awaiting_refinement and state.current_disease:
-        refined = refine_treatments_for_message(TREATMENTS, state.current_disease, req.message)
+    if state.awaiting_refinement and state.current_disease and message.strip():
+        refined = refine_treatments_for_message(TREATMENTS, state.current_disease, message)
         state.awaiting_refinement = False
         SESSIONS.update(state)
         return ChatResponse(
@@ -723,27 +891,61 @@ async def chat(req: ChatRequest) -> ChatResponse:
         )
 
     # -----------------------
+    # 0) CNN on images (if any)
+    # -----------------------
+    cnn_disease: Optional[str] = None
+    cnn_conf: float = 0.0
+    cnn_conflict: bool = False
+
+    if images:
+        cnn_disease, cnn_conf, cnn_conflict = run_cnn_on_images(images, debug)
+        debug["cnn_disease"] = cnn_disease
+        debug["cnn_confidence"] = cnn_conf
+        debug["cnn_conflict"] = cnn_conflict
+
+        # If only images and they're unclear/conflicting -> ask for text description
+        if (cnn_conflict or cnn_disease is None) and not message.strip():
+            reply = (
+                "Based on the images alone, I cannot clearly match them to a single disease. "
+                "Some images give mixed or low-confidence signals.\n\n"
+                "Please also describe the leaf symptoms in words, for example:\n"
+                "- Colour and pattern of spots or streaks on leaves\n"
+                "- Which part of the plant is most affected\n"
+                "- Any stunting, yellowing, or dead tillers\n"
+                "- Recent weather (very wet / humid, or very dry)\n\n"
+                "With that description plus the images, I can give a more reliable diagnosis."
+            )
+            return ChatResponse(
+                session_id=state.session_id,
+                reply=reply,
+                disease_name=None,
+                intent=None,
+                raw_intent_label="OTHER",
+                awaiting_refinement=False,
+                used_cnn_prediction=False,
+                debug=debug,
+            )
+
+    # -----------------------
     # 1) Predict intent from text (ML)
     # -----------------------
-    intent, raw_label = detect_intent_ml(req.message)
+    intent, raw_label = detect_intent_ml(message)
     debug["raw_intent_label"] = raw_label
     debug["intent"] = intent.name
 
     # -----------------------
-    # 2) Decide disease (NEW ORDERING)
+    # 2) Decide disease (ordering: CNN -> session -> history -> text)
     # -----------------------
     disease: Optional[str] = None
 
-    # 2.1 CNN prediction first (if supplied & confident)
-    if req.cnn_prediction and req.cnn_prediction.confidence >= 0.6:
-        pred_name = req.cnn_prediction.disease_name.strip()
-        if pred_name in KB:
-            disease = pred_name
-            used_cnn = True
-            debug["cnn_prediction_used"] = True
-            debug["cnn_confidence"] = req.cnn_prediction.confidence
-        else:
-            debug["cnn_prediction_ignored"] = f"Unknown disease '{pred_name}'"
+    # 2.1 CNN suggestion first if confident and non-conflicting
+    if cnn_disease and not cnn_conflict and cnn_disease in KB:
+        disease = cnn_disease
+        used_cnn = True
+        debug["cnn_prediction_used"] = True
+    elif cnn_conflict:
+        # we already handled pure image-conflict above; here we have text as well
+        debug["cnn_prediction_ignored"] = "conflicting high-confidence classes"
 
     # 2.2 If we already have a disease in this session, reuse it
     if disease is None and state.current_disease:
@@ -751,8 +953,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
         debug["session_disease_reused"] = disease
 
     # 2.3 Try to infer disease from HISTORY (previous user messages)
-    if disease is None and req.history:
-        inferred = infer_disease_from_history(KB, req.history, debug)
+    if disease is None and history_items:
+        inferred = infer_disease_from_history(KB, history_items, debug)
         if inferred:
             disease = inferred
             debug["history_disease_used"] = inferred
@@ -760,7 +962,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # 2.4 If STILL no disease, and the CURRENT message looks like
     #     symptoms / diagnosis question, guess from THIS message
     if disease is None and raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
-        guessed, score, matches = guess_disease_from_symptoms(KB, req.message)
+        guessed, score, matches = guess_disease_from_symptoms(KB, message)
         if guessed:
             disease = guessed
             state.last_guess_score = score
@@ -772,7 +974,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     # 2.5 Absolute last resort – try guessing from this message anyway
     if disease is None:
-        guessed, score, matches = guess_disease_from_symptoms(KB, req.message)
+        guessed, score, matches = guess_disease_from_symptoms(KB, message)
         if guessed:
             disease = guessed
             state.last_guess_score = score
@@ -787,13 +989,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # -----------------------
     if disease is None:
         reply = (
-            "I could not confidently match those symptoms or questions to a specific disease "
+            "I could not confidently match the current images or description to a specific disease "
             "in my knowledge base (normal, blast, brown_spot, hispa, dead_heart, tungro).\n\n"
             "It might be a nutrient problem, a different pest/disease, or symptoms not "
             "fully covered here. You can try describing:\n"
-            "- colour and pattern of spots or streaks on leaves,\n"
-            "- whether plants are stunted or tillering poorly,\n"
-            "- and any insects or unusual weather recently."
+            "- Colour and pattern of spots or streaks on leaves\n"
+            "- Whether plants are stunted or tillering poorly\n"
+            "- Any insects you see on leaves or stems\n"
+            "- Recent weather (very wet / humid, or very dry)\n"
         )
         return ChatResponse(
             session_id=state.session_id,
@@ -813,14 +1016,26 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # 4) Build answer text
     # -----------------------
     header = ""
-    if raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
+
+    if used_cnn and not message.strip():
+        # Images-only case with clear CNN diagnosis
+        header = (
+            f"From the images you uploaded, this most likely matches "
+            f"**{disease.replace('_', ' ')}**.\n\n"
+        )
+    elif raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
         header = (
             f"From the symptoms or question you provided, this most likely matches "
             f"**{disease.replace('_', ' ')}**.\n\n"
         )
+    elif used_cnn and message.strip():
+        header = (
+            f"Based on both your description and the images, this most likely matches "
+            f"**{disease.replace('_', ' ')}**.\n\n"
+        )
 
     reply_body, needs_refinement = answer_question(
-        KB, TREATMENTS, disease, req.message, intent
+        KB, TREATMENTS, disease, message, intent
     )
 
     reply = header + reply_body
@@ -842,10 +1057,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
         debug=debug,
     )
 
-frontend_dir = Path(__file__).resolve().parent / "frontend"
+frontend_dir = get_base_dir() / "frontend"
 
 if frontend_dir.exists():
-    # Serve the React build at root "/"
     app.mount(
         "/",
         StaticFiles(directory=frontend_dir, html=True),
