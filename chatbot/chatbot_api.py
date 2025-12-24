@@ -386,16 +386,48 @@ def load_treatments() -> Dict[str, List[TreatmentOption]]:
 # -----------------------------------------------------------------------------
 
 IMG_SIZE = 224
-CLASS_NAMES = ["normal", "blast", "brown_spot", "hispa", "dead_heart", "tungro"]
 
-MODEL_PATH = get_base_dir() / "best_model.keras"
+BASE_DIR = get_base_dir()
+MODEL_PATH = BASE_DIR / "best_model.keras"
+CLASS_INDICES_PATH = BASE_DIR / "class_indices.json"
 
+# -------------------------------------------------------------------------
+# Load class names (10-class list) from JSON saved during training
+# -------------------------------------------------------------------------
 try:
-    if MODEL_PATH.exists():
-        print(f"[INFO] Loading image model from {MODEL_PATH}")
-        IMAGE_MODEL = load_keras_model(MODEL_PATH)
+    if CLASS_INDICES_PATH.exists():
+        with open(CLASS_INDICES_PATH, "r", encoding="utf-8") as f:
+            CLASS_NAMES: List[str] = json.load(f)
+        print(f"[INFO] Loaded {len(CLASS_NAMES)} class names from {CLASS_INDICES_PATH}")
     else:
-        print(f"[WARN] best_model.keras not found at {MODEL_PATH}. Image predictions disabled.")
+        print(f"[WARN] class_indices.json not found at {CLASS_INDICES_PATH}. "
+              f"Image predictions disabled.")
+        CLASS_NAMES = []
+except Exception as e:
+    print(f"[WARN] Failed to load class_indices.json: {e}")
+    CLASS_NAMES = []
+
+# -------------------------------------------------------------------------
+# Load Keras model
+# -------------------------------------------------------------------------
+try:
+    if MODEL_PATH.exists() and CLASS_NAMES:
+        print(f"[INFO] Loading image model from {MODEL_PATH}")
+        IMAGE_MODEL = load_keras_model(MODEL_PATH, compile=False)
+
+        # Sanity check: model output size vs class list length
+        num_outputs = IMAGE_MODEL.output_shape[-1]
+        if num_outputs != len(CLASS_NAMES):
+            print(
+                f"[WARN] Model outputs {num_outputs} units, "
+                f"but {len(CLASS_NAMES)} class names are loaded. "
+                f"Disabling image predictions to avoid misaligned labels."
+            )
+            IMAGE_MODEL = None
+    else:
+        if not MODEL_PATH.exists():
+            print(f"[WARN] best_model.keras not found at {MODEL_PATH}. "
+                  f"Image predictions disabled.")
         IMAGE_MODEL = None
 except Exception as e:
     print(f"[WARN] Failed to load best_model.keras: {e}")
@@ -403,9 +435,17 @@ except Exception as e:
 
 
 def preprocess_image_bytes(data: bytes) -> np.ndarray:
+    """
+    Preprocess raw image bytes to a float32 array of shape (H, W, 3),
+    using the SAME preprocessing as during training.
+
+    Important: NO /255.0 here because the training pipeline fed raw
+    0–255 images into the model (EfficientNet's internal preprocessing
+    handles the rest).
+    """
     img = Image.open(io.BytesIO(data)).convert("RGB")
     img = img.resize((IMG_SIZE, IMG_SIZE))
-    arr = np.array(img, dtype="float32") / 255.0
+    arr = np.array(img, dtype="float32")  # 0–255 range, no scaling
     return arr  # shape (H, W, 3)
 
 
@@ -422,7 +462,8 @@ def run_cnn_on_images(
     - cnn_confidence: average top confidence for that class
     - conflict_flag: True if high-confidence images disagree
     """
-    if IMAGE_MODEL is None or not upload_files:
+    # If model or class names are not available, skip
+    if IMAGE_MODEL is None or not CLASS_NAMES or not upload_files:
         return None, 0.0, False
 
     # Cap at 5 images as per frontend
@@ -448,7 +489,9 @@ def run_cnn_on_images(
     if not images_arr:
         return None, 0.0, False
 
-    batch = np.stack(images_arr, axis=0)  # shape (N, H, W, 3)
+    # Shape: (N, H, W, 3) with float32 0–255, same as training
+    batch = np.stack(images_arr, axis=0).astype("float32")
+
     probs_batch = IMAGE_MODEL.predict(batch)
     probs_batch = probs_batch.astype(float)
 
@@ -470,7 +513,10 @@ def run_cnn_on_images(
                 "filename": filenames[i],
                 "top_class": top_disease,
                 "top_confidence": top_conf,
-                "probs": {name: float(p) for name, p in zip(CLASS_NAMES, probs)},
+                "probs": {
+                    name: float(p)
+                    for name, p in zip(CLASS_NAMES, probs)
+                },
             }
         )
 
@@ -495,8 +541,10 @@ def run_cnn_on_images(
     consensus_class = next(iter(unique_classes))
     avg_conf = float(
         sum(conf for cls, conf in zip(top_classes, top_confidences)
-            if cls == consensus_class) / max(
-            sum(1 for cls in high_conf_classes if cls == consensus_class), 1
+            if cls == consensus_class)
+        / max(
+            sum(1 for cls in high_conf_classes if cls == consensus_class),
+            1,
         )
     )
 
