@@ -22,6 +22,7 @@ import {
 } from "@mui/icons-material";
 import AddIcon from "@mui/icons-material/Add";
 import type { PaletteMode } from "@mui/material";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 
 type ChatRole = "user" | "assistant";
 type Language = "en" | "si";
@@ -48,6 +49,11 @@ interface ChatMessage {
 interface PaddyChatProps {
   mode: PaletteMode;
   toggleMode: () => void;
+
+  lang: Language;
+  onLangChange: (lang: Language) => void;
+
+  onBackHome: () => void;
 }
 
 const API_URL = "http://127.0.0.1:5000/api/chat";
@@ -111,11 +117,18 @@ const STRINGS: Record<Language, any> = {
   },
 };
 
-const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
+const PaddyChat: React.FC<PaddyChatProps> = ({
+  mode,
+  toggleMode,
+  lang,
+  onLangChange,
+  onBackHome,
+}) => {
   const theme = useTheme();
 
   // ✅ Language state
-  const [lang, setLang] = useState<Language>("en");
+  // const [lang, setLang] = useState<Language>("en");
+  // const t = useMemo(() => STRINGS[lang], [lang]);
   const t = useMemo(() => STRINGS[lang], [lang]);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -313,8 +326,8 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
   // 🌐 Language change → new session (required)
   const handleLanguageChange = (_: any, next: Language | null) => {
     if (!next || next === lang) return;
-    setLang(next);
-    resetSession(next); // ✅ new session + clear chat when language changes
+    onLangChange(next);
+    resetSession(next);
   };
 
   const backgroundGradient =
@@ -510,6 +523,26 @@ const PaddyChat: React.FC<PaddyChatProps> = ({ mode, toggleMode }) => {
           overflow: "hidden",
         }}
       >
+        <Box
+          sx={{
+            px: 1.5,
+            py: 1.5,
+            borderBottom: `1px solid ${theme.palette.divider}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-start",
+            gap: 1,
+          }}
+        >
+          <Button
+            variant="outlined"
+            size="small"
+            startIcon={<ArrowBackIcon fontSize="small" />}
+            onClick={onBackHome}
+          >
+            {lang === "si" ? "මුල් පිටුව" : "Home"}
+          </Button>
+        </Box>
         {/* Header */}
         <Box
           sx={{
