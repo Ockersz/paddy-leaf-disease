@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Paddy Disease Chatbot API (FastAPI + ML Intent Classifier + Image CNN)
+Paddy Disease Chatbot API (FastAPI + Intent (EN ML / SI heuristic) + Image CNN)
 
 Expected files in the SAME folder (chatbot directory):
 - symptoms_causes.csv
 - treatments_scenarios.csv
+- symptoms_causes_si.csv
+- treatments_scenarios_si.csv
 - intent_classifier.joblib
-- best_model.keras        <-- image classifier
+- best_model.keras
 
-Run (example):
+Run:
     uvicorn chatbot_api:app --reload --port 5000
 """
 
@@ -22,7 +24,7 @@ import secrets
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Literal
 
 import joblib
 import numpy as np
@@ -40,6 +42,9 @@ from tensorflow.keras.models import load_model as load_keras_model
 
 def get_base_dir() -> Path:
     return Path(__file__).resolve().parent
+
+
+Language = Literal["en", "si"]
 
 
 # -----------------------------------------------------------------------------
@@ -76,11 +81,11 @@ class TreatmentOption:
 # -----------------------------------------------------------------------------
 
 class Intent(Enum):
-    SYMPTOMS = auto()      # describing / asking what it looks like
-    MANAGEMENT = auto()    # treatment / control
-    PREVENTION = auto()    # prevent / next season
-    CAUSE = auto()         # what causes this
-    GENERAL = auto()       # catch all / chit-chat / misc
+    SYMPTOMS = auto()
+    MANAGEMENT = auto()
+    PREVENTION = auto()
+    CAUSE = auto()
+    GENERAL = auto()
 
 
 class ChatRole(str, Enum):
@@ -89,7 +94,6 @@ class ChatRole(str, Enum):
     system = "system"
 
 
-# Raw labels from the ML classifier
 INTENT_LABELS = {
     "SYMPTOM_DESCRIPTION",
     "ASK_DIAGNOSIS",
@@ -109,25 +113,12 @@ class HistoryItem(BaseModel):
     content: str
 
 
-class CNNPrediction(BaseModel):
-    disease_name: str
-    confidence: float = Field(..., ge=0.0, le=1.0)
-
-
-class ChatRequest(BaseModel):
-    """Kept for reference – actual endpoint uses multipart form instead."""
-    session_id: Optional[str] = None
-    message: str
-    history: List[HistoryItem] = Field(default_factory=list)
-    cnn_prediction: Optional[CNNPrediction] = None
-
-
 class ChatResponse(BaseModel):
     session_id: str
     reply: str
     disease_name: Optional[str] = None
-    intent: Optional[str] = None            # high-level intent name
-    raw_intent_label: Optional[str] = None  # ML label (SYMPTOM_DESCRIPTION, ASK_TREATMENT, etc.)
+    intent: Optional[str] = None
+    raw_intent_label: Optional[str] = None
     awaiting_refinement: bool = False
     used_cnn_prediction: bool = False
     debug: Dict[str, object] = Field(default_factory=dict)
@@ -171,7 +162,7 @@ class SessionStore:
 # NLP helpers
 # -----------------------------------------------------------------------------
 
-STOPWORDS = {
+STOPWORDS_EN = {
     "the", "and", "or", "a", "an", "of", "to", "in", "on", "for", "with",
     "is", "are", "was", "were", "be", "been", "being",
     "it", "this", "that", "these", "those",
@@ -181,24 +172,35 @@ STOPWORDS = {
     "very", "really", "just", "like",
 }
 
+# Minimal Sinhala fillers (optional; safe to keep small)
+STOPWORDS_SI = {
+    "සහ", "හෝ", "එය", "මෙය", "එම", "ඔබ", "මම", "අපි", "ඔවුන්",
+    "ද", "දක්වා", "මත", "තුළ", "පිළිබඳ", "වැනි", "නම්", "නැත",
+}
 
-def preprocess_text(text: str) -> List[str]:
+
+def preprocess_text(text: str, lang: Language) -> List[str]:
     text = text.lower()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
+
+    if lang == "en":
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        tokens = [t.strip() for t in text.split() if t.strip()]
+        tokens = [t for t in tokens if t not in STOPWORDS_EN]
+        return tokens
+
+    # Sinhala: keep Unicode letters/numbers, split on whitespace/punct
+    text = re.sub(r"[^\w\u0D80-\u0DFF]+", " ", text, flags=re.UNICODE)
     tokens = [t.strip() for t in text.split() if t.strip()]
-    tokens = [t for t in tokens if t not in STOPWORDS]
+    tokens = [t for t in tokens if t not in STOPWORDS_SI]
     return tokens
 
 
 def guess_disease_from_symptoms(
     kb: Dict[str, DiseaseInfo],
     symptom_text: str,
+    lang: Language,
 ) -> Tuple[Optional[str], float, Dict[str, List[str]]]:
-    """
-    Use token overlap between user symptom text and stored
-    leaf symptom keywords + detailed description.
-    """
-    user_tokens = set(preprocess_text(symptom_text))
+    user_tokens = set(preprocess_text(symptom_text, lang))
     if not user_tokens:
         return None, 0.0, {}
 
@@ -209,13 +211,12 @@ def guess_disease_from_symptoms(
     for name, info in kb.items():
         kw_tokens = set()
         for kw in info.key_leaf_symptom_keywords:
-            kw_tokens.update(preprocess_text(kw))
-        desc_tokens = set(preprocess_text(info.leaf_symptoms_detailed))
+            kw_tokens.update(preprocess_text(kw, lang))
+        desc_tokens = set(preprocess_text(info.leaf_symptoms_detailed, lang))
 
         common_kw = kw_tokens.intersection(user_tokens)
         common_desc = desc_tokens.intersection(user_tokens)
 
-        # Weighted: keyword matches count double
         score = 2 * len(common_kw) + 1 * len(common_desc)
         matches_per[name] = list(common_kw.union(common_desc))
 
@@ -223,60 +224,55 @@ def guess_disease_from_symptoms(
             best_score = score
             best_name = name
 
-    MIN_SCORE = 1.0
-    if best_name is None or best_score < MIN_SCORE:
+    if best_name is None or best_score < 1.0:
         return None, 0.0, matches_per
 
     return best_name, best_score, matches_per
 
 
-def extract_context_from_text(
-    text: str,
-) -> Tuple[str, str, str]:
-    """
-    Roughly extract (crop_stage, weather_condition, water_condition)
-    from a free-text description.
-    """
+def extract_context_from_text(text: str) -> Tuple[str, str, str]:
     lower = text.lower()
 
-    # crop stage
     stage = "general"
-    if any(w in lower for w in ["nursery", "seedling", "tray"]):
+    if any(w in lower for w in ["nursery", "seedling", "tray", "මඩුව", "බීජ පැළ"]):
         stage = "nursery"
-    elif any(w in lower for w in ["tillering", "tiller", "vegetative"]):
+    elif any(w in lower for w in ["tillering", "tiller", "vegetative", "ටිලරී", "වර්ධන"]):
         stage = "vegetative"
-    elif any(w in lower for w in ["booting", "heading", "panicle", "flowering"]):
+    elif any(w in lower for w in ["booting", "heading", "panicle", "flowering", "බූටින්ග්", "හිඩින්ග්", "පැනිකල"]):
         stage = "booting_heading"
-    elif any(w in lower for w in ["grain filling", "ripening", "harvest", "mature"]):
+    elif any(w in lower for w in ["grain filling", "ripening", "harvest", "mature", "ධාන්‍ය පිරවීම", "කප්පාදු"]):
         stage = "reproductive"
 
-    # weather
     weather = "normal"
-    if any(w in lower for w in ["rain", "raining", "showers", "wet", "humid", "fog", "cloudy", "dew", "monsoon"]):
+    if any(w in lower for w in ["rain", "raining", "showers", "wet", "humid", "fog", "cloudy", "dew", "monsoon",
+                                "වැසි", "තෙත්", "ආර්ද්‍ර", "වලාකුළු", "ගංවතුර"]):
         weather = "rainy_humid"
-    if any(w in lower for w in ["dry", "no rain", "drought", "hot and dry", "cracked soil"]):
+    if any(w in lower for w in ["dry", "no rain", "drought", "hot and dry", "cracked soil",
+                                "වියළි", "වැසි නැත", "නියඟ", "පස ප裂"]):
         weather = "dry_drought"
 
-    # water
     water = "any"
-    if any(w in lower for w in ["standing water", "flooded", "waterlogged", "ponded"]):
+    if any(w in lower for w in ["standing water", "flooded", "waterlogged", "ponded",
+                                "ජලය රැඳී", "ජලයෙන් පිරි", "ගංවතුර", "වතුරෙන් පිරි"]):
         water = "flooded"
-    if any(w in lower for w in ["no water", "dry soil", "cracked", "drained"]):
+    if any(w in lower for w in ["no water", "dry soil", "cracked", "drained",
+                                "ජලය නැත", "වියළි පස", "පස ප裂", "නිකාසය"]):
         water = "dry"
-    if any(w in lower for w in ["alternate wetting", "awd", "intermittent"]):
+    if any(w in lower for w in ["alternate wetting", "awd", "intermittent",
+                                "awd", "විකල්ප තෙත් කිරීම"]):
         water = "awd"
 
     return stage, weather, water
 
 
 # -----------------------------------------------------------------------------
-# Intent classifier loading
+# Intent classifier loading + Sinhala heuristic
 # -----------------------------------------------------------------------------
 
 def load_intent_model():
     path = get_base_dir() / "intent_classifier.joblib"
     if not path.exists():
-        print("[WARN] intent_classifier.joblib not found - falling back to naive GENERAL intent.")
+        print("[WARN] intent_classifier.joblib not found - falling back to GENERAL.")
         return None
     print(f"[INFO] Loading intent classifier from {path}")
     return joblib.load(path)
@@ -286,13 +282,7 @@ INTENT_MODEL = load_intent_model()
 
 
 def map_label_to_intent(label: str) -> Intent:
-    """
-    Map the ML label to our high-level Intent enum.
-    """
-    if label == "SYMPTOM_DESCRIPTION":
-        return Intent.SYMPTOMS
-    if label == "ASK_DIAGNOSIS":
-        # Asking disease name is effectively a 'what disease / symptoms' question
+    if label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
         return Intent.SYMPTOMS
     if label == "ASK_TREATMENT":
         return Intent.MANAGEMENT
@@ -300,39 +290,57 @@ def map_label_to_intent(label: str) -> Intent:
         return Intent.PREVENTION
     if label == "ASK_CAUSE":
         return Intent.CAUSE
-    # OTHER or unknown
     return Intent.GENERAL
 
 
-def detect_intent_ml(message: str) -> Tuple[Intent, str]:
+def detect_intent(message: str, lang: Language) -> Tuple[Intent, str]:
     """
-    Use the ML model to predict intent.
-    Returns:
-        (high_level_intent, raw_label)
+    EN: ML intent classifier (your joblib)
+    SI: heuristic keyword detection (because the ML model is likely EN-trained)
     """
-    if not message.strip():
-        # No text: treat as GENERAL / OTHER
+    msg = (message or "").strip()
+    if not msg:
         return Intent.GENERAL, "OTHER"
 
+    if lang == "si":
+        m = msg.lower()
+
+        # treatment / management
+        if any(k in m for k in ["ප්‍රතිකාර", "කළමනාකරණ", "පාලනය", "මර්දනය", "ආරක්ෂා", "කියන්න"]):
+            return Intent.MANAGEMENT, "ASK_TREATMENT"
+
+        # prevention
+        if any(k in m for k in ["වැළැක්ව", "වළක්ව", "ඉදිරි වගාව", "ඊළඟ වාරය", "මීළඟ"]):
+            return Intent.PREVENTION, "ASK_PREVENTION"
+
+        # cause
+        if any(k in m for k in ["හේතුව", "කොහොමද ඇතිවෙන්නේ", "ඇයි", "කාරණා", "වෛරස", "ෆංගස්", "කීට"]):
+            return Intent.CAUSE, "ASK_CAUSE"
+
+        # symptoms / diagnosis
+        if any(k in m for k in ["ලක්ෂණ", "රෝගය මොකක්ද", "මොකක්ද මේ", "හඳුනා", "කොළ", "ලප", "කහ", "අළු", "ඕවල්", "දිගු"]):
+            return Intent.SYMPTOMS, "ASK_DIAGNOSIS"
+
+        return Intent.GENERAL, "OTHER"
+
+    # English ML path
     if INTENT_MODEL is None:
         return Intent.GENERAL, "OTHER"
 
-    label = INTENT_MODEL.predict([message])[0]
+    label = INTENT_MODEL.predict([msg])[0]
     if label not in INTENT_LABELS:
         label = "OTHER"
-
-    intent = map_label_to_intent(label)
-    return intent, label
+    return map_label_to_intent(label), label
 
 
 # -----------------------------------------------------------------------------
-# Knowledge loading (CSV)
+# Knowledge loading (CSV) - language aware
 # -----------------------------------------------------------------------------
 
-def load_symptoms_causes() -> Dict[str, DiseaseInfo]:
-    path = get_base_dir() / "symptoms_causes.csv"
+def load_symptoms_causes_csv(filename: str) -> Dict[str, DiseaseInfo]:
+    path = get_base_dir() / filename
     if not path.exists():
-        raise FileNotFoundError("symptoms_causes.csv not found next to chatbot_api.py")
+        raise FileNotFoundError(f"{filename} not found next to chatbot_api.py")
 
     kb: Dict[str, DiseaseInfo] = {}
     with path.open(newline="", encoding="utf-8") as f:
@@ -340,7 +348,7 @@ def load_symptoms_causes() -> Dict[str, DiseaseInfo]:
         for row in reader:
             name = row["disease_name"].strip()
             kw_raw = row.get("key_leaf_symptom_keywords") or ""
-            kw_list = [k.strip().lower() for k in kw_raw.split(";") if k.strip()]
+            kw_list = [k.strip() for k in kw_raw.split(";") if k.strip()]
             kb[name] = DiseaseInfo(
                 name=name,
                 short_overview=(row.get("short_overview") or "").strip(),
@@ -355,10 +363,10 @@ def load_symptoms_causes() -> Dict[str, DiseaseInfo]:
     return kb
 
 
-def load_treatments() -> Dict[str, List[TreatmentOption]]:
-    path = get_base_dir() / "treatments_scenarios.csv"
+def load_treatments_csv(filename: str) -> Dict[str, List[TreatmentOption]]:
+    path = get_base_dir() / filename
     if not path.exists():
-        raise FileNotFoundError("treatments_scenarios.csv not found next to chatbot_api.py")
+        raise FileNotFoundError(f"{filename} not found next to chatbot_api.py")
 
     disease_to_options: Dict[str, List[TreatmentOption]] = {}
     with path.open(newline="", encoding="utf-8") as f:
@@ -366,7 +374,7 @@ def load_treatments() -> Dict[str, List[TreatmentOption]]:
         for row in reader:
             name = row["disease_name"].strip()
             kw_raw = row.get("key_context_keywords") or ""
-            kw_list = [k.strip().lower() for k in kw_raw.split(";") if k.strip()]
+            kw_list = [k.strip() for k in kw_raw.split(";") if k.strip()]
             opt = TreatmentOption(
                 disease_name=name,
                 scenario_label=(row.get("scenario_label") or "").strip(),
@@ -381,53 +389,33 @@ def load_treatments() -> Dict[str, List[TreatmentOption]]:
     return disease_to_options
 
 
+# Load both languages at import time
+KB_BY_LANG: Dict[Language, Dict[str, DiseaseInfo]] = {
+    "en": load_symptoms_causes_csv("symptoms_causes.csv"),
+    "si": load_symptoms_causes_csv("symptoms_causes_si.csv"),
+}
+
+TREATMENTS_BY_LANG: Dict[Language, Dict[str, List[TreatmentOption]]] = {
+    "en": load_treatments_csv("treatments_scenarios.csv"),
+    "si": load_treatments_csv("treatments_scenarios_si.csv"),
+}
+
+
 # -----------------------------------------------------------------------------
 # Image model (best_model.keras)
 # -----------------------------------------------------------------------------
 
 IMG_SIZE = 224
+CLASS_NAMES = ["normal", "blast", "brown_spot", "hispa", "dead_heart", "tungro"]
 
-BASE_DIR = get_base_dir()
-MODEL_PATH = BASE_DIR / "best_model.keras"
-CLASS_INDICES_PATH = BASE_DIR / "class_indices.json"
+MODEL_PATH = get_base_dir() / "best_model.keras"
 
-# -------------------------------------------------------------------------
-# Load class names (10-class list) from JSON saved during training
-# -------------------------------------------------------------------------
 try:
-    if CLASS_INDICES_PATH.exists():
-        with open(CLASS_INDICES_PATH, "r", encoding="utf-8") as f:
-            CLASS_NAMES: List[str] = json.load(f)
-        print(f"[INFO] Loaded {len(CLASS_NAMES)} class names from {CLASS_INDICES_PATH}")
-    else:
-        print(f"[WARN] class_indices.json not found at {CLASS_INDICES_PATH}. "
-              f"Image predictions disabled.")
-        CLASS_NAMES = []
-except Exception as e:
-    print(f"[WARN] Failed to load class_indices.json: {e}")
-    CLASS_NAMES = []
-
-# -------------------------------------------------------------------------
-# Load Keras model
-# -------------------------------------------------------------------------
-try:
-    if MODEL_PATH.exists() and CLASS_NAMES:
+    if MODEL_PATH.exists():
         print(f"[INFO] Loading image model from {MODEL_PATH}")
-        IMAGE_MODEL = load_keras_model(MODEL_PATH, compile=False)
-
-        # Sanity check: model output size vs class list length
-        num_outputs = IMAGE_MODEL.output_shape[-1]
-        if num_outputs != len(CLASS_NAMES):
-            print(
-                f"[WARN] Model outputs {num_outputs} units, "
-                f"but {len(CLASS_NAMES)} class names are loaded. "
-                f"Disabling image predictions to avoid misaligned labels."
-            )
-            IMAGE_MODEL = None
+        IMAGE_MODEL = load_keras_model(MODEL_PATH)
     else:
-        if not MODEL_PATH.exists():
-            print(f"[WARN] best_model.keras not found at {MODEL_PATH}. "
-                  f"Image predictions disabled.")
+        print(f"[WARN] best_model.keras not found at {MODEL_PATH}. Image predictions disabled.")
         IMAGE_MODEL = None
 except Exception as e:
     print(f"[WARN] Failed to load best_model.keras: {e}")
@@ -435,18 +423,10 @@ except Exception as e:
 
 
 def preprocess_image_bytes(data: bytes) -> np.ndarray:
-    """
-    Preprocess raw image bytes to a float32 array of shape (H, W, 3),
-    using the SAME preprocessing as during training.
-
-    Important: NO /255.0 here because the training pipeline fed raw
-    0–255 images into the model (EfficientNet's internal preprocessing
-    handles the rest).
-    """
     img = Image.open(io.BytesIO(data)).convert("RGB")
     img = img.resize((IMG_SIZE, IMG_SIZE))
-    arr = np.array(img, dtype="float32")  # 0–255 range, no scaling
-    return arr  # shape (H, W, 3)
+    arr = np.array(img, dtype="float32") / 255.0
+    return arr
 
 
 def run_cnn_on_images(
@@ -454,26 +434,15 @@ def run_cnn_on_images(
     debug: Dict[str, object],
     confidence_threshold: float = 0.6,
 ) -> Tuple[Optional[str], float, bool]:
-    """
-    Run the CNN on up to 5 images, return:
-      (cnn_disease, cnn_confidence, conflict_flag)
-
-    - cnn_disease: best class if confident and consistent, else None
-    - cnn_confidence: average top confidence for that class
-    - conflict_flag: True if high-confidence images disagree
-    """
-    # If model or class names are not available, skip
-    if IMAGE_MODEL is None or not CLASS_NAMES or not upload_files:
+    if IMAGE_MODEL is None or not upload_files:
         return None, 0.0, False
 
-    # Cap at 5 images as per frontend
     upload_files = upload_files[:5]
-
     images_arr: List[np.ndarray] = []
     filenames: List[str] = []
 
     for uf in upload_files:
-        data = uf.file.read()  # synchronous is fine inside FastAPI path
+        data = uf.file.read()
         if not data:
             continue
         try:
@@ -481,23 +450,16 @@ def run_cnn_on_images(
             images_arr.append(arr)
             filenames.append(uf.filename or "image")
         except Exception as e:
-            # Skip problematic images but log in debug
-            debug.setdefault("image_errors", []).append(
-                {"filename": uf.filename, "error": str(e)}
-            )
+            debug.setdefault("image_errors", []).append({"filename": uf.filename, "error": str(e)})
 
     if not images_arr:
         return None, 0.0, False
 
-    # Shape: (N, H, W, 3) with float32 0–255, same as training
-    batch = np.stack(images_arr, axis=0).astype("float32")
-
-    probs_batch = IMAGE_MODEL.predict(batch)
-    probs_batch = probs_batch.astype(float)
+    batch = np.stack(images_arr, axis=0)
+    probs_batch = IMAGE_MODEL.predict(batch).astype(float)
 
     top_classes: List[str] = []
     top_confidences: List[float] = []
-
     per_image_debug = []
 
     for i, probs in enumerate(probs_batch):
@@ -508,119 +470,239 @@ def run_cnn_on_images(
         top_classes.append(top_disease)
         top_confidences.append(top_conf)
 
-        per_image_debug.append(
-            {
-                "filename": filenames[i],
-                "top_class": top_disease,
-                "top_confidence": top_conf,
-                "probs": {
-                    name: float(p)
-                    for name, p in zip(CLASS_NAMES, probs)
-                },
-            }
-        )
+        per_image_debug.append({
+            "filename": filenames[i],
+            "top_class": top_disease,
+            "top_confidence": top_conf,
+            "probs": {name: float(p) for name, p in zip(CLASS_NAMES, probs)},
+        })
 
     debug["image_predictions"] = per_image_debug
 
-    # Consider only reasonably confident predictions
-    high_conf_classes = [
-        cls for cls, conf in zip(top_classes, top_confidences)
-        if conf >= confidence_threshold
-    ]
-
+    high_conf_classes = [cls for cls, conf in zip(top_classes, top_confidences) if conf >= confidence_threshold]
     if not high_conf_classes:
-        # All images are low confidence
         return None, 0.0, False
 
     unique_classes = set(high_conf_classes)
     if len(unique_classes) > 1:
-        # Conflicting diseases across images
         return None, 0.0, True
 
-    # All confident predictions agree on the same disease
     consensus_class = next(iter(unique_classes))
-    avg_conf = float(
-        sum(conf for cls, conf in zip(top_classes, top_confidences)
-            if cls == consensus_class)
-        / max(
-            sum(1 for cls in high_conf_classes if cls == consensus_class),
-            1,
-        )
-    )
+    confs = [conf for cls, conf in zip(top_classes, top_confidences) if cls == consensus_class]
+    avg_conf = float(sum(confs) / max(len(confs), 1))
 
     return consensus_class, avg_conf, False
 
 
 # -----------------------------------------------------------------------------
-# Core answer / treatment formatting
+# Localized phrasing (EN/SI)
 # -----------------------------------------------------------------------------
 
-def format_disease_explanation(info: DiseaseInfo) -> str:
+UI = {
+    "en": {
+        "images_unclear": (
+            "Based on the images alone, I cannot clearly match them to a single disease. "
+            "Some images give mixed or low-confidence signals.\n\n"
+            "Please also describe the leaf symptoms in words, for example:\n"
+            "- Colour and pattern of spots or streaks on leaves\n"
+            "- Which part of the plant is most affected\n"
+            "- Any stunting, yellowing, or dead tillers\n"
+            "- Recent weather (very wet / humid, or very dry)\n\n"
+            "With that description plus the images, I can give a more reliable diagnosis."
+        ),
+        "no_match": (
+            "I could not confidently match the current images or description to a specific disease "
+            "in my knowledge base (normal, blast, brown_spot, hispa, dead_heart, tungro).\n\n"
+            "It might be a nutrient problem, a different pest/disease, or symptoms not "
+            "fully covered here. You can try describing:\n"
+            "- Colour and pattern of spots or streaks on leaves\n"
+            "- Whether plants are stunted or tillering poorly\n"
+            "- Any insects you see on leaves or stems\n"
+            "- Recent weather (very wet / humid, or very dry)\n"
+        ),
+        "header_symptom": "From the symptoms or question you provided, this most likely matches **{disease}**.\n\n",
+        "header_images": "From the images you uploaded, this most likely matches **{disease}**.\n\n",
+        "header_both": "Based on both your description and the images, this most likely matches **{disease}**.\n\n",
+        "healthy_keep": (
+            "The crop appears healthy based on the current diagnosis.\n\n"
+            "To keep it that way, focus on good agronomy:\n"
+            "- Use recommended varieties and certified seed.\n"
+            "- Maintain balanced fertilisation and good land levelling.\n"
+            "- Keep fields and bunds weed-free and irrigate on time.\n"
+            "- Monitor regularly so that any pest or disease is caught early.\n\n"
+            "No disease-specific pesticide is needed when the crop is healthy."
+        ),
+        "overview_title": "Disease: {disease}",
+        "overview": "Overview:\n{txt}",
+        "leaf": "Symptoms on leaves:\n{txt}",
+        "plant": "Whole-plant effects:\n{txt}",
+        "cause": "Cause:\n{txt}",
+        "favour": "Conditions favouring outbreaks:\n{txt}",
+        "cause_block": "Cause of {disease}:\n{cause}\n\nConditions that favour this problem:\n{fav}",
+        "treat_overview_intro": "For {disease}, here is a high-level overview of management options under different situations:\n",
+        "treat_refine_prompt": (
+            "To tailor these recommendations more precisely, please describe:\n"
+            "- The current weather (mostly rainy and humid, very dry, or normal)\n"
+            "- The crop stage (nursery, vegetative/tillering, booting–heading, or near harvest)\n"
+            "- How water is managed (standing water, AWD, or quite dry)\n"
+        ),
+        "refined_intro": "Given the conditions you described (stage: {stage}, weather: {weather}, water: {water}), the most relevant options for {disease} are:\n",
+        "refined_footer": (
+            "\nAlways cross-check these steps with your local Department of Agriculture "
+            "or extension officer, and strictly follow product labels for any pesticides "
+            "or seed treatments."
+        ),
+        "no_specific_scenario": (
+            "For {disease} under the described conditions, I don't have a very specific scenario stored. "
+            "You can still consider the general cultural, variety and IPM steps already listed, "
+            "and follow local extension advice for any chemical use."
+        ),
+        "general_hints": (
+            "\n\nYou can ask follow-up questions such as:\n"
+            "- How do I treat this disease?\n"
+            "- How can I prevent it next season?\n"
+            "- What exactly causes this problem?"
+        ),
+    },
+    "si": {
+        "images_unclear": (
+            "රූප පමණක් භාවිතා කරලා එකම රෝගයකට පැහැදිලිව ගැළපෙන්න තරම් විශ්වාසයක් නැහැ. "
+            "රූප කිහිපයකින් මිශ්‍ර/අඩු විශ්වාස ප්‍රතිඵල ලැබෙනවා.\n\n"
+            "කරුණාකර ලක්ෂණ වචන වලින්ත් විස්තර කරන්න:\n"
+            "- කොළ මත ලප/රේඛා වල වර්ණය සහ ආකෘතිය\n"
+            "- ශාකයේ කුමන කොටස වැඩියෙන් බලපෑමට ලක්වෙලාද\n"
+            "- පැළ කුඩා වීම, කහ වීම, මැරුණු ටිලරී වගේ ලක්ෂණ තිබේද\n"
+            "- මෑත කාලගුණය (වැසි/ආර්ද්‍ර, හෝ වියළි)\n\n"
+            "එසේ කළාම රූප + විස්තර දෙකම මත වඩා විශ්වාසදායක නිගමනයක් දෙන්න පුළුවන්."
+        ),
+        "no_match": (
+            "දැනට ඇති රූප හෝ විස්තර මත, මගේ දත්ත ගබඩාවේ රෝගයක් (normal, blast, brown_spot, hispa, dead_heart, tungro) "
+            "සමඟ විශ්වාසදායක ලෙස ගැළපීමට නොහැකි විය.\n\n"
+            "පෝෂණ ගැටලුවක්, වෙනත් පළිබෝධයක්/රෝගයක්, හෝ මෙහි ආවරණය නොවූ ලක්ෂණයක් විය හැක. කරුණාකර මෙවැනි දේවල් කියන්න:\n"
+            "- කොළ මත ලප/රේඛා වල වර්ණය සහ ආකෘතිය\n"
+            "- පැළ කුඩා වීම හෝ ටිලරී අඩුවීම තිබේද\n"
+            "- කොළ/කඳේ කීටයන් දකින්නේද\n"
+            "- මෑත කාලගුණය (වැසි/ආර්ද්‍ර හෝ වියළි)\n"
+        ),
+        "header_symptom": "ඔබ ලබාදුන් ලක්ෂණ/ප්‍රශ්නය මත, වැඩි ඉඩකඩ ඇත්තේ **{disease}** වේ.\n\n",
+        "header_images": "ඔබ උඩුගත කළ රූප මත, වැඩි ඉඩකඩ ඇත්තේ **{disease}** වේ.\n\n",
+        "header_both": "ඔබගේ විස්තරය සහ රූප දෙකම මත, වැඩි ඉඩකඩ ඇත්තේ **{disease}** වේ.\n\n",
+        "healthy_keep": (
+            "දැනට ලැබුණු නිගමනය අනුව වගාව සුව පෙනෙයි.\n\n"
+            "එය එසේම තබා ගැනීමට:\n"
+            "- නිර්දේශිත වර්ග සහ සහතික කළ බීජ භාවිතා කරන්න.\n"
+            "- සම්මත පොෂණය සහ හොඳ මට්ටම් කිරීම පවත්වා ගන්න.\n"
+            "- බැඳුම්/ක්ෂේත්‍රය පිරිසිදු කර කාලෝචිත ජල සැපයුම පවත්වා ගන්න.\n"
+            "- නිරන්තර නිරීක්ෂණය කරන්න.\n\n"
+            "වගාව සුව නම් රෝගයට විශේෂිත රසායනිකයක් අවශ්‍ය නැහැ."
+        ),
+        "overview_title": "රෝගය: {disease}",
+        "overview": "සාරාංශය:\n{txt}",
+        "leaf": "කොළ ලක්ෂණ:\n{txt}",
+        "plant": "ශාකයේ සමස්ථ බලපෑම:\n{txt}",
+        "cause": "හේතුව:\n{txt}",
+        "favour": "රෝගය වැඩි වීමට හේතු වන කොන්දේසි:\n{txt}",
+        "cause_block": "{disease} හේතුව:\n{cause}\n\nරෝගය වැඩි වීමට හේතු වන කොන්දේසි:\n{fav}",
+        "treat_overview_intro": "{disease} සඳහා, තත්ව අනුව කළමනාකරණ මාර්ගෝපදේශ සාරාංශයක් මෙන්න:\n",
+        "treat_refine_prompt": (
+            "තවත් නිවැරදිව නිර්දේශ තෝරා දීමට කරුණාකර කියන්න:\n"
+            "- කාලගුණය (වැසි/ආර්ද්‍ර, වියළි, හෝ සාමාන්‍ය)\n"
+            "- වගා අදියර (මඩුව, වර්ධන/ටිලරී, බූටින්ග්–හිඩින්ග්, හෝ කප්පාදු ආසන්නය)\n"
+            "- ජල කළමනාකරණය (ජලය රැඳී තිබේද, AWD ද, හෝ වියළි ද)\n"
+        ),
+        "refined_intro": "ඔබ පැවසූ තත්වය අනුව (අදියර: {stage}, කාලගුණය: {weather}, ජලය: {water}) {disease} සඳහා වැදගත් නිර්දේශ:\n",
+        "refined_footer": (
+            "\nදේශීය කෘෂිකර්ම උපදේශක/කෘෂි දෙපාර්තමේන්තු උපදෙස්ද සමඟ සනාථ කරගෙන, "
+            "ඕනෑම රසායනික භාවිතයකදී ලේබල් උපදෙස් දැඩිව අනුගමනය කරන්න."
+        ),
+        "no_specific_scenario": (
+            "ඔබ පැවසූ තත්වයට ගැළපෙන විශේෂ සෙනාරියෝ එකක් දැනට දත්ත ගබඩාවේ නැහැ. "
+            "එහෙත් සාමාන්‍ය සංස්කෘතික/බීජ/ IPM ක්‍රියාමාර්ග අනුගමනය කර, "
+            "රසායනික භාවිතය සඳහා දේශීය උපදෙස් අනුගමනය කරන්න."
+        ),
+        "general_hints": (
+            "\n\nඔබට අසන්න පුළුවන් තවත් ප්‍රශ්න:\n"
+            "- මේක ප්‍රතිකාර කරන්නේ කොහොමද?\n"
+            "- ඉදිරි වගාවට වැළැක්වීම කොහොමද?\n"
+            "- හේතුව මොකක්ද?"
+        ),
+    },
+}
+
+
+def disease_disp(lang: Language, disease_key: str) -> str:
+    # Prefer Sinhala/English content from KB itself for nice labels if you later decide to store display names.
+    # For now keep key -> readable
+    return disease_key.replace("_", " ")
+
+
+# -----------------------------------------------------------------------------
+# Treatment formatting
+# -----------------------------------------------------------------------------
+
+def format_disease_explanation(info: DiseaseInfo, lang: Language) -> str:
+    u = UI[lang]
     parts: List[str] = []
-    parts.append("Disease: %s" % info.name.replace("_", " "))
+    parts.append(u["overview_title"].format(disease=disease_disp(lang, info.name)))
+
     if info.short_overview:
-        parts.append("\nOverview:\n%s" % info.short_overview)
-    if info.leaf_symptoms_brief or info.leaf_symptoms_detailed:
-        leaf_text = info.leaf_symptoms_brief
-        if info.leaf_symptoms_detailed:
-            if leaf_text:
-                leaf_text += " " + info.leaf_symptoms_detailed
-            else:
-                leaf_text = info.leaf_symptoms_detailed
-        parts.append("\nSymptoms on leaves:\n%s" % leaf_text)
+        parts.append("\n" + u["overview"].format(txt=info.short_overview))
+    leaf_text = " ".join([t for t in [info.leaf_symptoms_brief, info.leaf_symptoms_detailed] if t]).strip()
+    if leaf_text:
+        parts.append("\n" + u["leaf"].format(txt=leaf_text))
     if info.plant_symptoms_detailed:
-        parts.append("\nWhole-plant effects:\n%s" % info.plant_symptoms_detailed)
+        parts.append("\n" + u["plant"].format(txt=info.plant_symptoms_detailed))
     if info.cause_summary:
-        parts.append("\nCause:\n%s" % info.cause_summary)
+        parts.append("\n" + u["cause"].format(txt=info.cause_summary))
     if info.conditions_favouring:
-        parts.append(
-            "\nConditions favouring outbreaks:\n%s" % info.conditions_favouring
-        )
+        parts.append("\n" + u["favour"].format(txt=info.conditions_favouring))
+
     return "\n".join(parts)
 
 
 def format_treatment_overview(
     disease_name: str,
     options: List[TreatmentOption],
+    lang: Language,
 ) -> str:
+    u = UI[lang]
     if not options:
-        return "I do not yet have detailed treatment options stored for this disease."
+        return "I do not yet have detailed treatment options stored for this disease." if lang == "en" else \
+               "මෙම රෝගයට අදාළ විස්තරාත්මක කළමනාකරණ විකල්ප තවමත් දත්ත ගබඩාවේ සම්පූර්ණ නොවේ."
 
-    name_disp = disease_name.replace("_", " ")
-    parts: List[str] = []
-    parts.append(
-        "For %s, here is a high-level overview of management options under different situations:\n"
-        % name_disp
-    )
+    name_disp = disease_disp(lang, disease_name)
+    parts: List[str] = [u["treat_overview_intro"].format(disease=name_disp)]
 
     by_type: Dict[str, List[TreatmentOption]] = {}
     for opt in options:
         by_type.setdefault(opt.recommendation_type, []).append(opt)
 
-    type_titles = {
-        "cultural": "Cultural / field management:",
-        "variety_seed": "Variety and seed management:",
-        "nutrient_water": "Nutrient and water management:",
-        "chemical_biological": "Chemical / biological options (need-based):",
-        "monitoring": "Monitoring and decision-making:",
-        "ipm": "Integrated pest management (IPM) guidelines:",
-    }
+    if lang == "en":
+        type_titles = {
+            "cultural": "Cultural / field management:",
+            "variety_seed": "Variety and seed management:",
+            "nutrient_water": "Nutrient and water management:",
+            "chemical_biological": "Chemical / biological options (need-based):",
+            "monitoring": "Monitoring and decision-making:",
+            "ipm": "Integrated pest management (IPM) guidelines:",
+        }
+    else:
+        type_titles = {
+            "cultural": "සංස්කෘතික / ක්ෂේත්‍ර කළමනාකරණය:",
+            "variety_seed": "වර්ග හා බීජ කළමනාකරණය:",
+            "nutrient_water": "පෝෂණ සහ ජල කළමනාකරණය:",
+            "chemical_biological": "රසායනික / ජෛවික විකල්ප (අවශ්‍යතාව මත):",
+            "monitoring": "නිරීක්ෂණය සහ තීරණ ගැනීම:",
+            "ipm": "IPM මාර්ගෝපදේශ:",
+        }
 
     for rec_type, opts in by_type.items():
-        title = type_titles.get(rec_type, rec_type.capitalize() + ":")
-        parts.append(title)
+        parts.append(type_titles.get(rec_type, rec_type + ":"))
         for opt in opts:
-            parts.append("  - %s: %s" % (opt.scenario_label, opt.recommendation_text))
+            parts.append(f"  - {opt.scenario_label}: {opt.recommendation_text}")
         parts.append("")
 
-    parts.append(
-        "To tailor these recommendations more precisely, please describe:\n"
-        "- The current weather (for example: mostly rainy and humid, or very dry, or normal),\n"
-        "- The crop stage (nursery, vegetative/tillering, booting–heading, or near harvest), and\n"
-        "- How water is usually managed (standing water, alternate wetting and drying, or quite dry).\n"
-        "Based on that, I can highlight the most relevant options."
-    )
-
+    parts.append(u["treat_refine_prompt"])
     return "\n".join(parts)
 
 
@@ -648,35 +730,36 @@ def format_refined_treatments(
     crop_stage: str,
     weather_condition: str,
     water_condition: str,
+    lang: Language,
 ) -> str:
-    name_disp = disease_name.replace("_", " ")
+    u = UI[lang]
+    name_disp = disease_disp(lang, disease_name)
+
     if not options:
-        return (
-            "For %s under the described conditions, I don't have a very specific "
-            "scenario stored. You can still consider the general cultural, variety "
-            "and IPM steps already listed, and follow local extension advice for any "
-            "chemical use." % name_disp
-        )
+        return u["no_specific_scenario"].format(disease=name_disp)
 
     parts: List[str] = []
-    parts.append(
-        "Given the conditions you described (stage: %s, weather: %s, water: %s), the most relevant options for %s are:\n"
-        % (crop_stage, weather_condition, water_condition, name_disp)
-    )
+    parts.append(u["refined_intro"].format(
+        stage=crop_stage, weather=weather_condition, water=water_condition, disease=name_disp
+    ))
 
     for opt in options:
-        parts.append(
-            "- %s [%s]: %s"
-            % (opt.scenario_label, opt.recommendation_type, opt.recommendation_text)
-        )
+        parts.append(f"- {opt.scenario_label} [{opt.recommendation_type}]: {opt.recommendation_text}")
 
-    parts.append(
-        "\nAlways cross-check these steps with your local Department of Agriculture "
-        "or extension officer, and strictly follow product labels for any pesticides "
-        "or seed treatments."
-    )
-
+    parts.append(u["refined_footer"])
     return "\n".join(parts)
+
+
+def refine_treatments_for_message(
+    treatments_map: Dict[str, List[TreatmentOption]],
+    disease_name: str,
+    message: str,
+    lang: Language,
+) -> str:
+    stage, weather, water = extract_context_from_text(message)
+    all_opts = treatments_map.get(disease_name, [])
+    relevant = filter_treatments_for_context(all_opts, stage, weather, water)
+    return format_refined_treatments(disease_name, relevant, stage, weather, water, lang)
 
 
 def answer_question(
@@ -685,109 +768,67 @@ def answer_question(
     disease_name: str,
     message: str,
     intent: Intent,
+    lang: Language,
 ) -> Tuple[str, bool]:
-    """
-    Core brain once we know:
-    - which disease_name,
-    - which high-level intent.
-    Returns:
-        reply_text, needs_refinement_flag
-    """
+    u = UI[lang]
     disease_name = disease_name.strip()
+
     if disease_name not in kb:
         return (
-            "I don't have specific information for '%s' yet. Please check if the disease name matches the knowledge base."
-            % disease_name,
+            (f"I don't have specific information for '{disease_name}' yet."
+             if lang == "en"
+             else f"'{disease_name}' සඳහා විශේෂිත තොරතුරු දැනට දත්ත ගබඩාවේ නැහැ."),
             False,
         )
 
     info = kb[disease_name]
 
-    # Healthy crop special case
     if disease_name == "normal":
         if intent in (Intent.MANAGEMENT, Intent.PREVENTION):
-            txt = (
-                "The crop appears healthy based on the current diagnosis.\n\n"
-                "To keep it that way, focus on good agronomy:\n"
-                "- Use recommended varieties and certified seed.\n"
-                "- Maintain balanced fertilisation and good land levelling.\n"
-                "- Keep fields and bunds weed-free and irrigate on time.\n"
-                "- Monitor regularly so that any pest or disease is caught early.\n\n"
-                "No disease-specific pesticide is needed when the crop is healthy."
-            )
-            return txt, False
+            return u["healthy_keep"], False
+        return format_disease_explanation(info, lang), False
 
-        txt = format_disease_explanation(info)
-        return txt, False
-
-    # SYMPTOMS: describe what it looks like (and implied diagnosis)
     if intent == Intent.SYMPTOMS:
-        txt = format_disease_explanation(info)
-        return txt, False
+        return format_disease_explanation(info, lang), False
 
-    # CAUSE: focus on cause + conditions
     if intent == Intent.CAUSE:
-        txt = (
-            "Cause of %s:\n%s\n\nConditions that favour this problem:\n%s"
-            % (info.name.replace("_", " "), info.cause_summary, info.conditions_favouring)
+        txt = u["cause_block"].format(
+            disease=disease_disp(lang, info.name),
+            cause=info.cause_summary,
+            fav=info.conditions_favouring,
         )
         return txt, False
 
-    # PREVENTION: same tools as management, framed for next season
     if intent == Intent.PREVENTION:
         options = treatments_map.get(disease_name, [])
-        overview = format_treatment_overview(disease_name, options)
-        txt = (
-            "For prevention in future seasons, you generally use the same set of measures "
-            "as for management, but applied earlier and more systematically.\n\n%s"
-            % overview
-        )
-        return txt, True  # ask for conditions to refine further
+        overview = format_treatment_overview(disease_name, options, lang)
+        if lang == "en":
+            txt = ("For prevention in future seasons, you generally use the same set of measures "
+                   "as for management, but applied earlier and more systematically.\n\n" + overview)
+        else:
+            txt = ("ඉදිරි වගාව සඳහා වැළැක්වීමේදී, කළමනාකරණයට සමාන ක්‍රියාමාර්ග "
+                   "මුල් අවස්ථාවේ සිටම ක්‍රමානුකූලව භාවිතා කිරීම වැදගත්.\n\n" + overview)
+        return txt, True
 
-    # MANAGEMENT / TREATMENT
     if intent == Intent.MANAGEMENT:
         options = treatments_map.get(disease_name, [])
-        overview = format_treatment_overview(disease_name, options)
+        overview = format_treatment_overview(disease_name, options, lang)
         return overview, True
 
-    # GENERAL / fallback: give explanation + hints
-    txt = format_disease_explanation(info)
-    txt += (
-        "\n\nYou can ask follow-up questions such as:\n"
-        "- How do I treat this disease?\n"
-        "- How can I prevent it next season?\n"
-        "- What exactly causes this problem?"
-    )
+    txt = format_disease_explanation(info, lang) + u["general_hints"]
     return txt, False
 
 
-def refine_treatments_for_message(
-    treatments_map: Dict[str, List[TreatmentOption]],
-    disease_name: str,
-    message: str,
-) -> str:
-    stage, weather, water = extract_context_from_text(message)
-    all_opts = treatments_map.get(disease_name, [])
-    relevant = filter_treatments_for_context(all_opts, stage, weather, water)
-    return format_refined_treatments(disease_name, relevant, stage, weather, water)
-
-
 # -----------------------------------------------------------------------------
-# History-based disease inference
+# History-based disease inference (language-aware)
 # -----------------------------------------------------------------------------
 
 def infer_disease_from_history(
     kb: Dict[str, DiseaseInfo],
     history: List[HistoryItem],
+    lang: Language,
     debug: Dict[str, object],
 ) -> Optional[str]:
-    """
-    Look through previous user messages in history and try to recover a disease
-    based on the last SYMPTOM_DESCRIPTION / ASK_DIAGNOSIS-like messages.
-
-    This makes follow-ups like "How to treat it?" work even if session_id
-    wasn't reused by the frontend.
-    """
     if not history:
         return None
 
@@ -795,17 +836,15 @@ def infer_disease_from_history(
     best_score = 0.0
     used_message = None
 
-    # Walk from latest to oldest
     for item in reversed(history):
         if item.role != ChatRole.user:
             continue
 
-        intent, raw_label = detect_intent_ml(item.content)
-
+        _, raw_label = detect_intent(item.content, lang)
         if raw_label not in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
             continue
 
-        guessed, score, matches = guess_disease_from_symptoms(kb, item.content)
+        guessed, score, matches = guess_disease_from_symptoms(kb, item.content, lang)
         if guessed and score > best_score:
             best_disease = guessed
             best_score = score
@@ -825,41 +864,11 @@ def infer_disease_from_history(
     return best_disease
 
 
-def history_suggests_treatment_or_prevention(
-    history: List[HistoryItem],
-) -> bool:
-    """
-    Look backwards through user history.
-    If the last *relevant* user message was ASK_TREATMENT or ASK_PREVENTION,
-    we treat the current context-only message as a refinement.
-
-    We stop when we hit a clear symptom/diagnosis message, because that usually
-    means a new case.
-    """
-    for item in reversed(history):
-        if item.role != ChatRole.user:
-            continue
-
-        intent, raw_label = detect_intent_ml(item.content)
-
-        # If the last relevant question was about treatment/prevention,
-        # we want to refine for that.
-        if raw_label in ("ASK_TREATMENT", "ASK_PREVENTION"):
-            return True
-
-        # If we reach a symptom/diagnosis before any treatment/prevention,
-        # consider that a "new case" and stop.
-        if raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
-            return False
-
-    return False
-
-
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="Paddy Disease Chatbot API (intent classifier + history + images)")
+app = FastAPI(title="Paddy Disease Chatbot API (EN/SI + images)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -869,9 +878,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load knowledge at import time
-KB: Dict[str, DiseaseInfo] = load_symptoms_causes()
-TREATMENTS: Dict[str, List[TreatmentOption]] = load_treatments()
 SESSIONS = SessionStore()
 
 
@@ -879,9 +885,10 @@ SESSIONS = SessionStore()
 async def health() -> Dict[str, object]:
     return {
         "status": "ok",
-        "diseasesLoaded": list(KB.keys()),
         "intentModelLoaded": INTENT_MODEL is not None,
         "imageModelLoaded": IMAGE_MODEL is not None,
+        "diseasesLoaded_en": list(KB_BY_LANG["en"].keys()),
+        "diseasesLoaded_si": list(KB_BY_LANG["si"].keys()),
     }
 
 
@@ -890,41 +897,35 @@ async def chat(
     session_id: Optional[str] = Form(None),
     message: str = Form(""),
     history: str = Form("[]"),
+    language: Language = Form("en"),
     images: List[UploadFile] = File(default_factory=list),
 ) -> ChatResponse:
-    """
-    Main chat endpoint.
+    lang: Language = language if language in ("en", "si") else "en"
+    kb = KB_BY_LANG[lang]
+    treatments = TREATMENTS_BY_LANG[lang]
+    u = UI[lang]
 
-    Expects multipart/form-data from the React frontend:
-      - session_id: string (optional)
-      - message: string (may be empty if images only)
-      - history: JSON string of [{role, content}, ...]
-      - images: 0-5 image files (field name "images")
-    """
-    # Parse history JSON
+    debug: Dict[str, object] = {"lang": lang}
     history_items: List[HistoryItem] = []
-    debug: Dict[str, object] = {}
 
+    # Parse history JSON
     try:
-        if history:
-            raw_list = json.loads(history)
-            if isinstance(raw_list, list):
-                for item in raw_list:
-                    try:
-                        history_items.append(HistoryItem(**item))
-                    except Exception as e:
-                        debug.setdefault("history_parse_errors", []).append(
-                            {"item": item, "error": str(e)}
-                        )
+        raw_list = json.loads(history or "[]")
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                try:
+                    history_items.append(HistoryItem(**item))
+                except Exception as e:
+                    debug.setdefault("history_parse_errors", []).append({"item": item, "error": str(e)})
     except Exception as e:
         debug["history_json_error"] = str(e)
 
     state = SESSIONS.get_or_create(session_id)
     used_cnn = False
 
-    # If we are in "refinement" mode, this message is treated as weather/stage context
+    # Refinement mode: treat message as context
     if state.awaiting_refinement and state.current_disease and message.strip():
-        refined = refine_treatments_for_message(TREATMENTS, state.current_disease, message)
+        refined = refine_treatments_for_message(treatments, state.current_disease, message, lang)
         state.awaiting_refinement = False
         SESSIONS.update(state)
         return ChatResponse(
@@ -938,9 +939,7 @@ async def chat(
             debug=debug,
         )
 
-    # -----------------------
-    # 0) CNN on images (if any)
-    # -----------------------
+    # 0) CNN on images
     cnn_disease: Optional[str] = None
     cnn_conf: float = 0.0
     cnn_conflict: bool = False
@@ -951,21 +950,11 @@ async def chat(
         debug["cnn_confidence"] = cnn_conf
         debug["cnn_conflict"] = cnn_conflict
 
-        # If only images and they're unclear/conflicting -> ask for text description
+        # Images-only but unclear/conflicting => ask for symptom description in selected language
         if (cnn_conflict or cnn_disease is None) and not message.strip():
-            reply = (
-                "Based on the images alone, I cannot clearly match them to a single disease. "
-                "Some images give mixed or low-confidence signals.\n\n"
-                "Please also describe the leaf symptoms in words, for example:\n"
-                "- Colour and pattern of spots or streaks on leaves\n"
-                "- Which part of the plant is most affected\n"
-                "- Any stunting, yellowing, or dead tillers\n"
-                "- Recent weather (very wet / humid, or very dry)\n\n"
-                "With that description plus the images, I can give a more reliable diagnosis."
-            )
             return ChatResponse(
                 session_id=state.session_id,
-                reply=reply,
+                reply=u["images_unclear"],
                 disease_name=None,
                 intent=None,
                 raw_intent_label="OTHER",
@@ -974,43 +963,33 @@ async def chat(
                 debug=debug,
             )
 
-    # -----------------------
-    # 1) Predict intent from text (ML)
-    # -----------------------
-    intent, raw_label = detect_intent_ml(message)
+    # 1) Intent detection (lang-aware)
+    intent, raw_label = detect_intent(message, lang)
     debug["raw_intent_label"] = raw_label
     debug["intent"] = intent.name
 
-    # -----------------------
-    # 2) Decide disease (ordering: CNN -> session -> history -> text)
-    # -----------------------
+    # 2) Decide disease: CNN -> session -> history -> text
     disease: Optional[str] = None
 
-    # 2.1 CNN suggestion first if confident and non-conflicting
-    if cnn_disease and not cnn_conflict and cnn_disease in KB:
+    if cnn_disease and not cnn_conflict and cnn_disease in kb:
         disease = cnn_disease
         used_cnn = True
         debug["cnn_prediction_used"] = True
     elif cnn_conflict:
-        # we already handled pure image-conflict above; here we have text as well
         debug["cnn_prediction_ignored"] = "conflicting high-confidence classes"
 
-    # 2.2 If we already have a disease in this session, reuse it
     if disease is None and state.current_disease:
         disease = state.current_disease
         debug["session_disease_reused"] = disease
 
-    # 2.3 Try to infer disease from HISTORY (previous user messages)
     if disease is None and history_items:
-        inferred = infer_disease_from_history(KB, history_items, debug)
+        inferred = infer_disease_from_history(kb, history_items, lang, debug)
         if inferred:
             disease = inferred
             debug["history_disease_used"] = inferred
 
-    # 2.4 If STILL no disease, and the CURRENT message looks like
-    #     symptoms / diagnosis question, guess from THIS message
     if disease is None and raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
-        guessed, score, matches = guess_disease_from_symptoms(KB, message)
+        guessed, score, matches = guess_disease_from_symptoms(kb, message, lang)
         if guessed:
             disease = guessed
             state.last_guess_score = score
@@ -1020,9 +999,8 @@ async def chat(
                 "overlap_tokens": matches.get(guessed, []),
             }
 
-    # 2.5 Absolute last resort – try guessing from this message anyway
     if disease is None:
-        guessed, score, matches = guess_disease_from_symptoms(KB, message)
+        guessed, score, matches = guess_disease_from_symptoms(kb, message, lang)
         if guessed:
             disease = guessed
             state.last_guess_score = score
@@ -1032,23 +1010,11 @@ async def chat(
                 "overlap_tokens": matches.get(guessed, []),
             }
 
-    # -----------------------
-    # 3) If still no disease – generic fail-safe reply
-    # -----------------------
+    # 3) Still no disease => localized fail-safe
     if disease is None:
-        reply = (
-            "I could not confidently match the current images or description to a specific disease "
-            "in my knowledge base (normal, blast, brown_spot, hispa, dead_heart, tungro).\n\n"
-            "It might be a nutrient problem, a different pest/disease, or symptoms not "
-            "fully covered here. You can try describing:\n"
-            "- Colour and pattern of spots or streaks on leaves\n"
-            "- Whether plants are stunted or tillering poorly\n"
-            "- Any insects you see on leaves or stems\n"
-            "- Recent weather (very wet / humid, or very dry)\n"
-        )
         return ChatResponse(
             session_id=state.session_id,
-            reply=reply,
+            reply=u["no_match"],
             disease_name=None,
             intent=intent.name,
             raw_intent_label=raw_label,
@@ -1057,35 +1023,21 @@ async def chat(
             debug=debug,
         )
 
-    # Store disease in session
+    # Store in session
     state.current_disease = disease
 
-    # -----------------------
-    # 4) Build answer text
-    # -----------------------
+    # 4) Build answer
     header = ""
+    disp = disease_disp(lang, disease)
 
     if used_cnn and not message.strip():
-        # Images-only case with clear CNN diagnosis
-        header = (
-            f"From the images you uploaded, this most likely matches "
-            f"**{disease.replace('_', ' ')}**.\n\n"
-        )
+        header = u["header_images"].format(disease=disp)
     elif raw_label in ("SYMPTOM_DESCRIPTION", "ASK_DIAGNOSIS"):
-        header = (
-            f"From the symptoms or question you provided, this most likely matches "
-            f"**{disease.replace('_', ' ')}**.\n\n"
-        )
+        header = u["header_symptom"].format(disease=disp)
     elif used_cnn and message.strip():
-        header = (
-            f"Based on both your description and the images, this most likely matches "
-            f"**{disease.replace('_', ' ')}**.\n\n"
-        )
+        header = u["header_both"].format(disease=disp)
 
-    reply_body, needs_refinement = answer_question(
-        KB, TREATMENTS, disease, message, intent
-    )
-
+    reply_body, needs_refinement = answer_question(kb, treatments, disease, message, intent, lang)
     reply = header + reply_body
 
     state.last_intent = intent
@@ -1106,10 +1058,5 @@ async def chat(
     )
 
 frontend_dir = get_base_dir() / "frontend"
-
 if frontend_dir.exists():
-    app.mount(
-        "/",
-        StaticFiles(directory=frontend_dir, html=True),
-        name="frontend",
-    )
+    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
